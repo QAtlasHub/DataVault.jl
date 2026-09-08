@@ -1,6 +1,6 @@
 name = "DataVault"
 uuid = "23f5f8f6-b4da-40ee-8c72-c53b6c5de94f"
-version = "0.8.0"
+version = "0.7.9"
 authors = ["sota shimozono <shimozono-sota631@g.ecc.u-tokyo.ac.jp>"]
 
 [deps]

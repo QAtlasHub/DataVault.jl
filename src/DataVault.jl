@@ -36,7 +36,6 @@ export DataKey                          # re-export from ParamIO
 export is_done, mark_done!, mark_running!, touch_running!, running_heartbeat
 export clear_running!, is_running
 export acquire_running!, refresh_running!, running_age_secs
-export results
 export build_ledger, record_figure, cleanup_stale
 export archive_figure!, list_figure_history, restore_figure!
 export build_experiment_report, build_experiments_index, gather_code_versions

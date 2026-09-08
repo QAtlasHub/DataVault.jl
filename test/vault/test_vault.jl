@@ -468,3 +468,46 @@ end
         rm(outdir; recursive=true, force=true)
     end
 end
+
+# ── results ───────────────────────────────────────────────────────────────────
+
+@testset "results: pairs every done key with its payload" begin
+    with_vault() do vault, _
+        ks = DataVault.keys(vault)
+        @test length(ks) > 1                       # the fixture has to be able to distinguish
+        DataVault.save!(vault, ks[1], Dict("x" => 41))
+        DataVault.mark_done!(vault, ks[1])
+
+        got = collect(DataVault.results(vault))
+        @test length(got) == 1                     # only the done one, not all of `ks`
+        k, d = only(got)
+        @test k == ks[1]
+        @test d["x"] == 41
+    end
+end
+
+@testset "results: :done is the default because :all cannot be loaded" begin
+    with_vault() do vault, _
+        ks = DataVault.keys(vault)
+        DataVault.save!(vault, ks[1], Dict("x" => 1))
+        DataVault.mark_done!(vault, ks[1])
+
+        # The control for the default: asking for every key reaches one nobody computed, and `load`
+        # raises there. A default of :all would make the ordinary reader loop die on a half-finished
+        # sweep — which is the state a sweep is in for most of its life.
+        @test_throws ErrorException collect(DataVault.results(vault; status=:all))
+    end
+end
+
+@testset "results: lazy, so a large sweep is not materialised to read one point" begin
+    with_vault() do vault, _
+        ks = DataVault.keys(vault)
+        for k in ks
+            DataVault.save!(vault, k, Dict("x" => 1))
+            DataVault.mark_done!(vault, k)
+        end
+        it = DataVault.results(vault)
+        @test !(it isa AbstractVector)             # a generator, not a materialised Vector
+        @test first(it)[2]["x"] == 1               # …and taking one does not force the rest
+    end
+end

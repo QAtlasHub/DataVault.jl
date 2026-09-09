@@ -188,23 +188,30 @@ Behavior:
 
 Atomic: writes via tmp + rename so concurrent jobs cannot leave a partial file.
 """
+# Where a (project, run)'s log.toml lives. Also called BEFORE the Vault exists, to read back
+# the path scheme a run was written with.
+function _log_toml_path(
+    outdir::AbstractString, project::AbstractString, run::AbstractString
+)::String
+    return joinpath(outdir, DATAVAULT_DIR_NAME, project, "$(run).log.toml")
+end
+
 function _save_log_toml(vault::Vault)::String
     project = vault.spec.study.project_name
     dv_dir = joinpath(vault.outdir, DATAVAULT_DIR_NAME)
-    study_dir = joinpath(dv_dir, project)
-    log_path = joinpath(study_dir, "$(vault.run).log.toml")
+    log_path = _log_toml_path(vault.outdir, project, vault.run)
 
     _ensure_datavault_readme(dv_dir)
-    mkpath(study_dir)
+    mkpath(dirname(log_path))
 
-    is_default_formatter = vault.path_formatter === ParamIO.format_path
-    if !is_default_formatter
+    scheme_name = _path_scheme(vault.path_formatter)
+    formatter_name = _formatter_name(vault.path_formatter)
+    # "auto" IS reproducible — log.toml names the scheme and the config carries the value set it
+    # is derived from. Only a caller-supplied function is not.
+    if scheme_name == "custom"
         @warn "Custom path_formatter — path scheme is not reproducible from log.toml alone" run =
             vault.run
     end
-    formatter_name =
-        is_default_formatter ? "ParamIO.format_path" : string(nameof(vault.path_formatter))
-    scheme_name = is_default_formatter ? "default" : "custom"
 
     created_at = if isfile(log_path)
         existing = read_log_toml(log_path)

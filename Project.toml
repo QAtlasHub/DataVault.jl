@@ -16,7 +16,9 @@ TOML = "fa267f1f-6049-4f14-aa54-33bafae1ed76"
 Dates = "1.11.0"
 JLD2 = "0.6.4"
 JSON3 = "1"
-ParamIO = "0.3, 0.4"
+# 0.4 is the floor, not a preference: `float_format`, `build_axis_formats` and the 3-arg
+# `format_path` that the "auto" path scheme is built on all arrived in ParamIO 0.4.0.
+ParamIO = "0.4"
 Printf = "1.11.0"
 SHA = "0.7"
 TOML = "1.0.3"

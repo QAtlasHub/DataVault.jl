@@ -88,6 +88,25 @@ end
 _path_scheme(f::Function) = f === ParamIO.format_path ? "default" : "custom"
 _path_scheme(::AutoPathFormatter) = "auto"
 
+# The auto scheme's precision comes from the sweep's whole value set, so the scheme NAME alone
+# cannot rebuild a run's paths — adding one finer point to the config renames every directory
+# already on disk. These carry the derived table through log.toml; `-1` encodes the per-value
+# shortest-round-trip fallback, which has no single precision.
+_float_precision_table(::Function) = Dict{String,Int}()
+function _float_precision_table(f::AutoPathFormatter)
+    return Dict{String,Int}(
+        k => (v.fallback ? -1 : v.precision) for (k, v) in f.axis_formats
+    )
+end
+
+function _axis_formats_from_table(t::AbstractDict)
+    return Dict{String,ParamIO.AxisFloatFmt}(
+        String(k) =>
+            (v < 0 ? ParamIO.AxisFloatFmt(0, true) : ParamIO.AxisFloatFmt(v, false)) for
+        (k, v) in t
+    )
+end
+
 # The function log.toml names. `nameof` is only reached for a caller-supplied formatter; the two
 # built-in schemes name themselves, so an anonymous closure's "#3#4" never stands for one of them.
 function _formatter_name(f::Function)
@@ -137,16 +156,18 @@ function Vault(
     return vault
 end
 
-# Which scheme this (project, run) was actually written with, or `nothing` if it is new.
+# What this (project, run) was actually written with — `(scheme, precision)` — or `nothing`
+# if it is new.
 # A log.toml that exists but cannot be read is reported rather than treated as absent: silence
 # here would resolve the scheme from the config and move an existing run's data.
-function _recorded_scheme(
+function _recorded_path(
     outdir::AbstractString, project::AbstractString, run::AbstractString
 )
     log_path = _log_toml_path(outdir, project, run)
     isfile(log_path) || return nothing
     try
-        return read_log_toml(log_path).path_scheme
+        info = read_log_toml(log_path)
+        return (scheme=info.path_scheme, precision=info.path_float_precision)
     catch e
         e isa InterruptException && rethrow()
         @warn "log.toml unreadable — falling back to the config's path scheme, which may not be the one this run's data was written with" log_path exception =
@@ -163,19 +184,34 @@ function _resolve_formatter(
     explicit === nothing || return explicit
 
     declared = _declared_scheme(spec)
-    recorded = _recorded_scheme(outdir, spec.study.project_name, run)
-    recorded === nothing && return _build_formatter(declared, spec)
+    rec = _recorded_path(outdir, spec.study.project_name, run)
+    rec === nothing && return _build_formatter(declared, spec)
 
-    if recorded == "custom"
+    if rec.scheme == "custom"
         @warn "This run was written with a custom path_formatter, which log.toml cannot reproduce — pass `path_formatter=` to read it back" run declared_scheme =
             declared
         return _build_formatter(declared, spec)
     end
-    if recorded != declared
+    if rec.scheme != declared
         @warn "Config declares a different path scheme than this run was written with; keeping the run's own scheme so existing data stays reachable. Use a different `run` name to sweep under the new one." run recorded_scheme =
-            recorded config_scheme = declared
+            rec.scheme config_scheme = declared
     end
-    return _build_formatter(recorded, spec)
+    rec.scheme == "auto" || return _build_formatter(rec.scheme, spec)
+
+    # Auto rebuilds from the RECORDED precision. Deriving it from the config again would move
+    # every directory already on disk the moment the sweep grows a finer point.
+    if isempty(rec.precision)
+        @warn "This auto run predates precision recording, so its paths are derived from the config as it stands NOW — if the sweep has grown since, they are not where the data is" run
+        return _build_formatter("auto", spec)
+    end
+    from_config = _float_precision_table(
+        AutoPathFormatter(ParamIO.build_axis_formats(spec))
+    )
+    if from_config != rec.precision
+        @warn "The config's value set now implies a different float precision than this run was written with; keeping the recorded one so existing data stays reachable. New points render at the old precision and may collide — the grid check reports it if they do." run recorded =
+            rec.precision from_config = from_config
+    end
+    return AutoPathFormatter(_axis_formats_from_table(rec.precision))
 end
 
 # Two DISTINCT parameter points that format to ONE directory overwrite each other, and the

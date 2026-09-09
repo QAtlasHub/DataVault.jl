@@ -224,23 +224,47 @@ end
 
 # ── the public path API ───────────────────────────────────────────────────────
 
-@testset "the exported accessors are the vault's own paths" begin
+@testset "the path accessors are public but NOT exported" begin
+    exported = names(DataVault)
+    for n in (:param_path, :data_dir, :data_file, :status_dir, :bin_dir)
+        @test isdefined(DataVault, n)      # public: documented, callable, part of the API
+        @test !(n in exported)             # but qualified, so it cannot collide downstream
+    end
+
+    # The reason, as a live check rather than a comment. `data_dir` is a name a study naturally
+    # gives its own accessor — FiniteTemperature defines and exports one on its own vault type.
+    # Exporting it here too leaves the name unresolvable for anyone who uses both.
+    @eval module _StudyLike
+    using DataVault
+    struct StudyVault end
+    data_dir(::StudyVault, key) = "the study's own layout"
+    export data_dir
+    end
+    @eval module _UserScript
+    using DataVault
+    using ..._StudyLike
+    probe() = data_dir(_StudyLike.StudyVault(), nothing)
+    end
+    @test _UserScript.probe() == "the study's own layout"
+end
+
+@testset "the accessors are the vault's own paths" begin
     d = mktempdir(SCHEME_DIR)
     vault = Vault(scheme_config(d); run="phase1", check_paths=false)
     key = first(ParamIO.expand(vault.spec))
 
-    @test param_path(vault, key) == DataVault._param_path(vault, key)
-    @test data_dir(vault, key) == DataVault._data_dir(vault, key)
-    @test data_file(vault, key) == DataVault._data_file(vault, key)
-    @test data_file(vault, key; prefix="aux") ==
+    @test DataVault.param_path(vault, key) == DataVault._param_path(vault, key)
+    @test DataVault.data_dir(vault, key) == DataVault._data_dir(vault, key)
+    @test DataVault.data_file(vault, key) == DataVault._data_file(vault, key)
+    @test DataVault.data_file(vault, key; prefix="aux") ==
         DataVault._data_file(vault, key; prefix="aux")
-    @test status_dir(vault, key) == DataVault._status_dir(vault, key)
-    @test bin_dir(vault, key) == DataVault._bin_dir(vault, key)
+    @test DataVault.status_dir(vault, key) == DataVault._status_dir(vault, key)
+    @test DataVault.bin_dir(vault, key) == DataVault._bin_dir(vault, key)
 
     # …and they are the directory `save!` really used, not a plausible-looking string.
     DataVault.save!(vault, key, Dict("x" => 1.0))
-    @test isdir(data_dir(vault, key))
-    @test isfile(data_file(vault, key))
+    @test isdir(DataVault.data_dir(vault, key))
+    @test isfile(DataVault.data_file(vault, key))
 end
 
 @testset "the accessors follow the scheme; a hand-built path does not" begin
@@ -258,12 +282,12 @@ end
         ParamIO.format_path(k, vault.spec.path_keys),
     )
     @test length(Set(hand_built(k) for k in keys4)) == 2
-    @test length(Set(data_dir(vault, k) for k in keys4)) == 4
+    @test length(Set(DataVault.data_dir(vault, k) for k in keys4)) == 4
 
     # Concretely: for at least one key the hand-built path is not where the data is.
     k = last(keys4)
     DataVault.save!(vault, k, Dict("x" => 1.0))
-    @test isdir(data_dir(vault, k))
+    @test isdir(DataVault.data_dir(vault, k))
     @test !isdir(hand_built(k))
 end
 

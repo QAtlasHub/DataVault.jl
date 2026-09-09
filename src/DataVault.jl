@@ -33,7 +33,13 @@ import Base: keys
 
 export Vault
 export DataKey                          # re-export from ParamIO
-export param_path, data_dir, data_file, status_dir, bin_dir   # where a key lives on disk
+# `param_path` / `data_dir` / `data_file` / `status_dir` / `bin_dir` are public API — documented,
+# and what a consumer should call instead of rebuilding a path — but deliberately NOT exported.
+# `data_dir` and `status_dir` are names a study naturally gives its own accessors: FiniteTemperature
+# defines both on its own vault type and exports them, so exporting them here makes
+# `using DataVault, FiniteTemperature` leave `data_dir` unresolvable (UndefVarError, must be
+# qualified) in every script that uses both. Qualifying at the call site costs one prefix and
+# says which layout is meant.
 export is_done, mark_done!, mark_running!, touch_running!, running_heartbeat
 export clear_running!, is_running
 export acquire_running!, refresh_running!, running_age_secs

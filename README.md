@@ -4,7 +4,7 @@
 [![docs: dev](https://img.shields.io/badge/docs-dev-purple.svg)](https://codes.sota-shimozono.com/DataVault.jl/dev/)
 [![Julia](https://img.shields.io/badge/julia-v1.12+-9558b2.svg)](https://julialang.org)
 [![Code Style: Blue](https://img.shields.io/badge/Code%20Style-Blue-4495d1.svg)](https://github.com/invenia/BlueStyle)
-[![Build Status](https://github.com/sotashimozono/DataVault.jl/actions/workflows/CI.yml/badge.svg?branch=main)](https://github.com/sotashimozono/DataVault.jl/actions/workflows/CI.yml?query=branch%3Amain)
+[![Build Status](https://github.com/QAtlasHub/DataVault.jl/actions/workflows/CI.yml/badge.svg?branch=main)](https://github.com/QAtlasHub/DataVault.jl/actions/workflows/CI.yml?query=branch%3Amain)
 [![License](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
 config 駆動でパス解決・データ I/O・ledger 管理を提供する量子多体数値計算用のデータ管理基盤。

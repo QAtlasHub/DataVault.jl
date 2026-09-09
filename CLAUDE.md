@@ -1,6 +1,6 @@
 # CLAUDE.md — DataVault.jl
 
-**Layer 2 of the infra HPC stack** (ParamIO → DataVault → ParallelManager):
+**Layer 2 of the infra HPC stack** (ParamIO → DataVault → SweepRunner):
 maps a `DataKey` to file storage and tracks what's done. project-agnostic. See
 [`../CLAUDE.md`](../CLAUDE.md) for how the three layers fit together.
 
@@ -20,7 +20,7 @@ maps a `DataKey` to file storage and tracks what's done. project-agnostic. See
 - `README.md` — the most thorough doc in `infra/`: study/run hierarchy, the
   `log.toml` contract, the query API.
 - Full stack incl. the runtime that drives `save!`/`mark_done!` for you:
-  [`../ParallelManager.jl/examples/`](../ParallelManager.jl/examples/).
+  [`../SweepRunner.jl/examples/`](../SweepRunner.jl/examples/).
 
 ## Invariants when changing this package
 

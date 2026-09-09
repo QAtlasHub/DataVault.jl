@@ -12,7 +12,7 @@
 # - [`cleanup_stale`](@ref) reaps any `.running` whose heartbeat is
 #   older than `stale_after`.
 #
-# Downstream packages (e.g. `ParallelManager.jl`) should not maintain
+# Downstream packages (e.g. `SweepRunner.jl`) should not maintain
 # a separate lock-file tree — `acquire_running!` IS the lock.
 
 using Printf: @sprintf

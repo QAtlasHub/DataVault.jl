@@ -20,7 +20,7 @@ jobs:
     # Named rather than inherited: handing an entire secret store to another repository's
     # workflow for one optional token is the wrong shape.
     #
-    # This is also a test of where the boundary is. Measured on lab-sotashimozono/ITensorAD.jl#20,
+    # This is also a test of where the boundary is. Measured once on a private repo elsewhere,
     # a secret did NOT survive the call into this same reusable — but that caller is in a
     # DIFFERENT organisation. This one is not. If `collect` warns that no token arrived, the
     # boundary is per-repository and this repo needs the caller-side upload job too

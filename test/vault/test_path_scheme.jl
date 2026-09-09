@@ -146,4 +146,54 @@ end
     )
 end
 
+# ── the paths that report a failure, which must not report success ────────────
+
+@testset "a run written with a custom formatter says so when reopened without one" begin
+    d = mktempdir(SCHEME_DIR)
+    out = joinpath(d, "out")
+    cfg = scheme_config(d)
+    Vault(
+        cfg; run="phase1", outdir=out, path_formatter=(_, _) -> "LABEL", check_paths=false
+    )
+
+    # log.toml records "custom" and cannot reproduce the function. Reopening must SAY that
+    # rather than quietly resolve a different scheme and look in the wrong directory.
+    v = @test_logs (:warn, r"custom path_formatter, which log.toml cannot reproduce") match_mode =
+        :any Vault(cfg; run="phase1", outdir=out, check_paths=false)
+    @test v.path_formatter === ParamIO.format_path
+end
+
+@testset "an unreadable log.toml is reported, not read as 'no record'" begin
+    d = mktempdir(SCHEME_DIR)
+    out = joinpath(d, "out")
+    cfg = scheme_config(d; float_format="auto")
+    Vault(cfg; run="phase1", outdir=out, check_paths=false)
+
+    # Corrupt the anchor. Falling back silently would resolve the scheme from the config and
+    # could point at directories this run's data is not in.
+    log_path = DataVault._log_toml_path(out, "scheme", "phase1")
+    write(log_path, "this is not toml [[[")
+    @test_logs (:warn, r"log.toml unreadable") match_mode = :any try
+        Vault(cfg; run="phase1", outdir=out, check_paths=false)
+    catch                                  # _save_log_toml then fails on the same file
+    end
+end
+
+@testset "a grid the check cannot scan is reported as unchecked, never as clean" begin
+    d = mktempdir(SCHEME_DIR)
+    exploding = (_, _) -> error("formatter blew up")
+    @test_logs (:warn, r"Could not check the grid") match_mode = :any Vault(
+        scheme_config(d); run="phase1", path_formatter=exploding
+    )
+end
+
+@testset "more collisions than the warning lists are counted, not dropped" begin
+    d = mktempdir(SCHEME_DIR)
+    # Eight dt values, pairwise indistinguishable under %.2f -> four colliding directories,
+    # one more than the three the message shows.
+    dt = [0.011, 0.0111, 0.021, 0.0211, 0.031, 0.0311, 0.041, 0.0411]
+    msg = (:warn, r"and 1 more")
+    @test_logs msg match_mode = :any Vault(scheme_config(d; dt=dt); run="phase1")
+end
+
 rm(SCHEME_DIR; recursive=true, force=true)

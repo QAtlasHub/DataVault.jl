@@ -196,4 +196,49 @@ end
     @test_logs msg match_mode = :any Vault(scheme_config(d; dt=dt); run="phase1")
 end
 
+# ── the public path API ───────────────────────────────────────────────────────
+
+@testset "the exported accessors are the vault's own paths" begin
+    d = mktempdir(SCHEME_DIR)
+    vault = Vault(scheme_config(d); run="phase1", check_paths=false)
+    key = first(ParamIO.expand(vault.spec))
+
+    @test param_path(vault, key) == DataVault._param_path(vault, key)
+    @test data_dir(vault, key) == DataVault._data_dir(vault, key)
+    @test data_file(vault, key) == DataVault._data_file(vault, key)
+    @test data_file(vault, key; prefix="aux") ==
+        DataVault._data_file(vault, key; prefix="aux")
+    @test status_dir(vault, key) == DataVault._status_dir(vault, key)
+    @test bin_dir(vault, key) == DataVault._bin_dir(vault, key)
+
+    # …and they are the directory `save!` really used, not a plausible-looking string.
+    DataVault.save!(vault, key, Dict("x" => 1.0))
+    @test isdir(data_dir(vault, key))
+    @test isfile(data_file(vault, key))
+end
+
+@testset "the accessors follow the scheme; a hand-built path does not" begin
+    d = mktempdir(SCHEME_DIR)
+    vault = Vault(scheme_config(d; float_format="auto"); run="phase1", check_paths=false)
+    keys4 = ParamIO.expand(vault.spec)
+
+    # This is the line the twelve benchmark scripts write. It cannot see `float_format`, so it
+    # collapses four points onto two directories while the vault keeps them apart.
+    hand_built(k) = joinpath(
+        vault.outdir,
+        "data",
+        vault.spec.study.project_name,
+        vault.run,
+        ParamIO.format_path(k, vault.spec.path_keys),
+    )
+    @test length(Set(hand_built(k) for k in keys4)) == 2
+    @test length(Set(data_dir(vault, k) for k in keys4)) == 4
+
+    # Concretely: for at least one key the hand-built path is not where the data is.
+    k = last(keys4)
+    DataVault.save!(vault, k, Dict("x" => 1.0))
+    @test isdir(data_dir(vault, k))
+    @test !isdir(hand_built(k))
+end
+
 rm(SCHEME_DIR; recursive=true, force=true)

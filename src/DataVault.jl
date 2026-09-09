@@ -33,6 +33,7 @@ import Base: keys
 
 export Vault
 export DataKey                          # re-export from ParamIO
+export param_path, data_dir, data_file, status_dir, bin_dir   # where a key lives on disk
 export is_done, mark_done!, mark_running!, touch_running!, running_heartbeat
 export clear_running!, is_running
 export acquire_running!, refresh_running!, running_age_secs

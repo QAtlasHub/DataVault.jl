@@ -72,7 +72,10 @@ function attach(
     info = read_log_toml(log_path)
     outdir = _infer_outdir(log_path)
     config_path = _resolve_config_for_attach(info, outdir)
-    return Vault(config_path; run=info.run, outdir=outdir)
+    # No grid scan: `check_paths` asks "will this sweep overwrite itself", which is a question
+    # about writing. Attaching is a read, and `open_all` attaches once per run — a colliding
+    # study would otherwise re-warn on every discovery, forever.
+    return Vault(config_path; run=info.run, outdir=outdir, check_paths=false)
 end
 
 """
@@ -90,7 +93,7 @@ function open_all(outdir::AbstractString)::Vector{AttachedStudy}
             info = read_log_toml(log_path)
             inferred = _infer_outdir(log_path)
             config_path = _resolve_config_for_attach(info, inferred)
-            vault = Vault(config_path; run=info.run, outdir=inferred)
+            vault = Vault(config_path; run=info.run, outdir=inferred, check_paths=false)
             AttachedStudy(vault, info, log_path)
         catch e
             @warn "Failed to attach log.toml — skipping" path = log_path exception = e

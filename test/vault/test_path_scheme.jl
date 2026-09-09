@@ -4,6 +4,10 @@
 using Dates
 using Logging: Logging
 
+# A silence assertion is `@test_logs min_level=Logging.Warn expr` with NO pattern and the
+# DEFAULT match_mode. Adding `match_mode=:any` makes it vacuous — the patterns only have to be
+# a subset of what was logged, and the empty set always is, so a warning slips through.
+
 const SCHEME_DIR = mktempdir()
 
 # A grid whose float axis is FINER than `%.2f` can resolve. That is the discriminating shape:
@@ -106,9 +110,7 @@ end
     d = mktempdir(SCHEME_DIR)
     cfg = scheme_config(d; float_format="auto")
     # The "custom path_formatter" warning must NOT fire for a scheme the config declares.
-    vault = @test_logs min_level = Logging.Warn match_mode = :any Vault(
-        cfg; run="phase1", check_paths=false
-    )
+    vault = @test_logs min_level = Logging.Warn Vault(cfg; run="phase1", check_paths=false)
     info = read_log_toml(DataVault._log_toml_path(vault.outdir, "scheme", "phase1"))
     @test info.path_scheme == "auto"
     @test info.path_formatter == "ParamIO.format_path(auto)"
@@ -131,17 +133,17 @@ end
     )
     # Control: the SAME grid under auto, where nothing collides — a check that cannot stay
     # quiet is not a check.
-    @test_logs min_level = Logging.Warn match_mode = :any Vault(
+    @test_logs min_level = Logging.Warn Vault(
         scheme_config(joinpath(mkpath(joinpath(d, "ok"))); float_format="auto");
         run="phase1",
     )
     # Second control: a fixed2 grid whose values `%.2f` CAN separate.
-    @test_logs min_level = Logging.Warn match_mode = :any Vault(
+    @test_logs min_level = Logging.Warn Vault(
         scheme_config(joinpath(mkpath(joinpath(d, "coarse"))); dt=[0.1, 0.05, 0.02, 0.01]);
         run="phase1",
     )
     # …and the knob turns it off.
-    @test_logs min_level = Logging.Warn match_mode = :any Vault(
+    @test_logs min_level = Logging.Warn Vault(
         scheme_config(joinpath(mkpath(joinpath(d, "off")))); run="phase1", check_paths=false
     )
 end
@@ -239,6 +241,25 @@ end
     DataVault.save!(vault, k, Dict("x" => 1.0))
     @test isdir(data_dir(vault, k))
     @test !isdir(hand_built(k))
+end
+
+# ── reading is not writing ────────────────────────────────────────────────────
+
+@testset "attach and open_all do not re-run the write-side grid check" begin
+    d = mktempdir(SCHEME_DIR)
+    out = joinpath(d, "out")
+    cfg = scheme_config(d)                     # a grid that DOES collide
+
+    # Writing warns, once, where the sweep starts.
+    @test_logs (:warn, r"claimed by more than one parameter point") match_mode = :any Vault(
+        cfg; run="phase1", outdir=out
+    )
+
+    # Reading it back must not. `open_all` attaches once per run, so a colliding study would
+    # otherwise re-warn on every discovery for the rest of its life.
+    @test_logs min_level = Logging.Warn attach(out; project="scheme", run="phase1")
+    @test_logs min_level = Logging.Warn open_all(out)
+    @test length(open_all(out)) == 1
 end
 
 rm(SCHEME_DIR; recursive=true, force=true)

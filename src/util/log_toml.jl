@@ -44,6 +44,9 @@ struct LogTomlV1
     path_scheme::String
     path_formatter::String
     path_keys::Vector{String}
+    # Per-axis float precision for the "auto" scheme, `-1` meaning per-value shortest round-trip.
+    # Empty for every other scheme, and for auto runs written before it was recorded.
+    path_float_precision::Dict{String,Int}
 
     julia_version::String
     hostname::String
@@ -109,6 +112,9 @@ function _read_log_toml_v1(parsed::Dict, path::AbstractString)::LogTomlV1
         _need(pathb, "scheme", "path"),
         _need(pathb, "formatter", "path"),
         Vector{String}(_need(pathb, "keys", "path")),
+        Dict{String,Int}(
+            String(k) => Int(v) for (k, v) in get(pathb, "float_precision", Dict())
+        ),
         _need(prov, "julia_version", "provenance"),
         _need(prov, "hostname", "provenance"),
     )
@@ -251,6 +257,10 @@ function _save_log_toml(vault::Vault)::String
             "scheme" => scheme_name,
             "formatter" => formatter_name,
             "keys" => vault.spec.path_keys,
+            # The scheme NAME is not enough to rebuild an auto run's paths: the precision is
+            # derived from the sweep's whole value set, so adding one finer point to the config
+            # renames every directory already on disk. Recording it pins what this run used.
+            "float_precision" => _float_precision_table(vault.path_formatter),
         ),
         "provenance" =>
             Dict("julia_version" => string(VERSION), "hostname" => gethostname()),

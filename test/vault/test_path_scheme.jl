@@ -40,6 +40,30 @@ function scheme_config(
     return path
 end
 
+# A one-axis auto sweep, so the derived precision is easy to state.
+function auto_dt_config(dir::AbstractString, dts; out=joinpath(dir, "out"), name="cfg.toml")
+    path = joinpath(dir, name)
+    write(
+        path,
+        """
+        [study]
+        project_name  = "ext"
+        total_samples = 1
+        outdir        = "$(escape_string(out))"
+
+        [datavault]
+        path_keys = ["numerics.dt"]
+        float_format = "auto"
+
+        [[paramsets]]
+
+        [paramsets.numerics]
+        dt = $(dts)
+        """,
+    )
+    return path
+end
+
 # The directories a vault would actually create, one per DISTINCT parameter point.
 function param_paths(vault)
     return Set(DataVault._param_path(vault, k) for k in ParamIO.expand(vault.spec))
@@ -260,6 +284,101 @@ end
     @test_logs min_level = Logging.Warn attach(out; project="scheme", run="phase1")
     @test_logs min_level = Logging.Warn open_all(out)
     @test length(open_all(out)) == 1
+end
+
+# ── growing an auto sweep must not orphan what it already computed ────────────
+
+@testset "auto precision is pinned by log.toml, not re-derived from the config" begin
+    d = mktempdir(SCHEME_DIR)
+    out = joinpath(d, "out")
+
+    v1 = Vault(
+        auto_dt_config(d, [0.01, 0.005]; out=out, name="a.toml");
+        run="phase1",
+        check_paths=false,
+    )
+    for k in ParamIO.expand(v1.spec)
+        DataVault.save!(v1, k, Dict("dt" => k.params["numerics.dt"]))
+        mark_done!(v1, k)
+    end
+    @test length(DataVault.keys(v1; status=:done)) == 2
+    rec = read_log_toml(DataVault._log_toml_path(out, "ext", "phase1")).path_float_precision
+    @test rec == Dict("numerics.dt" => 3)      # 0.005 needs three decimals, 0.01 two
+
+    # Grow the sweep by one finer point — the ordinary way a study advances. Re-deriving the
+    # precision would renumber 0.010 -> 0.0100 and lose both finished points.
+    v2 = @test_logs (:warn, r"implies a different float precision") match_mode = :any Vault(
+        auto_dt_config(d, [0.01, 0.005, 0.0025]; out=out, name="b.toml");
+        run="phase1",
+        check_paths=false,
+    )
+    @test length(DataVault.keys(v2; status=:done)) == 2       # kept
+    @test length(DataVault.keys(v2; status=:pending)) == 1    # only the new point
+    @test DataVault.param_path(v2, first(ParamIO.expand(v1.spec))) ==
+        DataVault.param_path(v1, first(ParamIO.expand(v1.spec)))
+end
+
+@testset "a sweep that grows without changing the precision does not report a mismatch" begin
+    d = mktempdir(SCHEME_DIR)
+    out = joinpath(d, "out")
+    Vault(
+        auto_dt_config(d, [0.01, 0.005]; out=out, name="a.toml");
+        run="phase1",
+        check_paths=false,
+    )
+    # 0.015 needs three decimals too, so the pinned precision still describes the axis. Asserting
+    # TOTAL silence here would be testing the snapshot warning, which fires for its own reasons
+    # whenever the config file changes; the claim is about this warning specifically.
+    logs, _ = Test.collect_test_logs(; min_level=Logging.Warn) do
+        Vault(
+            auto_dt_config(d, [0.01, 0.005, 0.015]; out=out, name="b.toml");
+            run="phase1",
+            check_paths=false,
+        )
+    end
+    @test !any(r -> occursin("different float precision", string(r.message)), logs)
+    # …and the control for THAT: the same shape with a precision change does report it.
+    logs2, _ = Test.collect_test_logs(; min_level=Logging.Warn) do
+        Vault(
+            auto_dt_config(d, [0.01, 0.005, 0.0025]; out=out, name="c.toml");
+            run="phase1",
+            check_paths=false,
+        )
+    end
+    @test any(r -> occursin("different float precision", string(r.message)), logs2)
+end
+
+@testset "an auto run written before precision was recorded says so" begin
+    d = mktempdir(SCHEME_DIR)
+    out = joinpath(d, "out")
+    cfg = auto_dt_config(d, [0.01, 0.005]; out=out)
+    Vault(cfg; run="phase1", check_paths=false)
+
+    # Strip the record, as a log.toml written by an earlier DataVault would have it. Editing the
+    # parsed table rather than the text: it is written as a `[path.float_precision]` sub-table,
+    # so a line-oriented substitution silently matches nothing.
+    lp = DataVault._log_toml_path(out, "ext", "phase1")
+    parsed = TOML.parsefile(lp)
+    delete!(parsed["path"], "float_precision")
+    open(io -> TOML.print(io, parsed), lp, "w")
+    @test isempty(read_log_toml(lp).path_float_precision)
+    @test_logs (:warn, r"predates precision recording") match_mode = :any Vault(
+        cfg; run="phase1", check_paths=false
+    )
+end
+
+@testset "a new point that collides at the pinned precision is still reported" begin
+    d = mktempdir(SCHEME_DIR)
+    out = joinpath(d, "out")
+    Vault(
+        auto_dt_config(d, [0.01, 0.005]; out=out, name="a.toml");
+        run="phase1",
+        check_paths=false,
+    )
+    # Pinned at three decimals, 0.0051 renders as "0.005" — the same directory as 0.005.
+    @test_logs (:warn, r"claimed by more than one parameter point") match_mode = :any Vault(
+        auto_dt_config(d, [0.01, 0.005, 0.0051]; out=out, name="b.toml"); run="phase1"
+    )
 end
 
 rm(SCHEME_DIR; recursive=true, force=true)

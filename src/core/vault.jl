@@ -56,8 +56,9 @@ A formatter given this way cannot be reproduced from log.toml alone, so DataVaul
 
 Construction warns when two DISTINCT parameter points format to ONE directory — they would
 overwrite each other while the ledger reports both as done. One deduplicated pass over the
-expanded grid: 127 ms for the largest sweep in this fleet (90k keys, 900 distinct points).
-`check_paths=false` skips it for a caller that constructs vaults in a loop.
+expanded grid: on the largest sweep in this fleet (90k keys, 900 distinct points) it adds
+~150 ms warm, and ~1 s on the first call in a session, which is compilation. `check_paths=false`
+skips it; `attach` and `open_all` already pass it, being reads rather than writes.
 """
 struct Vault
     config_path::String
@@ -179,9 +180,9 @@ end
 
 # Two DISTINCT parameter points that format to ONE directory overwrite each other, and the
 # ledger still reports both as done. Checked here because this is where the formatter and the
-# grid first meet. Cost is one pass over the expanded grid, deduplicated on the path keys:
-# 127 ms for the largest sweep in this fleet (90k keys, 900 distinct points). Pass
-# `check_paths=false` to skip it.
+# grid first meet. One pass over the expanded grid, deduplicated on the path keys: ~150 ms warm
+# on the largest sweep in this fleet (90k keys, 900 distinct points), ~1 s on a session's first
+# call. Pass `check_paths=false` to skip it.
 function _warn_on_path_collisions(vault::Vault)
     claims = try
         seen = Set{Any}()

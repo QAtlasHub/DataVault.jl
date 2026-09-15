@@ -53,11 +53,16 @@ Config resolution order:
 The returned `Vault` is fully writable. Its constructor will idempotently
 upsert the log.toml, refreshing `[meta].datavault_version` and
 `datavault_git_hash`. `created_at` is preserved.
+
+`readonly=true` passes through to the constructor: the log.toml is validated but not rewritten, and
+the returned vault refuses the write verbs. Use it for aggregates, progress counters and plotting
+scripts, which otherwise leave a mark on every run they read.
 """
 function attach(
     path::AbstractString;
     project::Union{AbstractString,Nothing}=nothing,
     run::AbstractString="default",
+    readonly::Bool=false,
 )::Vault
     log_path = if project === nothing
         path
@@ -75,25 +80,37 @@ function attach(
     # No grid scan: `check_paths` asks "will this sweep overwrite itself", which is a question
     # about writing. Attaching is a read, and `open_all` attaches once per run — a colliding
     # study would otherwise re-warn on every discovery, forever.
-    return Vault(config_path; run=info.run, outdir=outdir, check_paths=false)
+    return Vault(
+        config_path; run=info.run, outdir=outdir, check_paths=false, readonly=readonly
+    )
 end
 
 """
-    open_all(outdir::AbstractString) -> Vector{AttachedStudy}
+    open_all(outdir::AbstractString; readonly=false) -> Vector{AttachedStudy}
 
 Discover every `*.log.toml` under `{outdir}/.datavault/` and attach to each.
 Broken log.toml files (unknown version, missing envelope, etc.) are logged
 as warnings and skipped so that iteration over a partially-corrupted
 outdir still yields the healthy studies.
+
+`readonly=true` attaches without writing. Discovery over an outdir touches every run it finds, so
+a counter or a plotter run against three runs that had never executed a key creates three log.toml
+files and freezes their key spaces.
 """
-function open_all(outdir::AbstractString)::Vector{AttachedStudy}
+function open_all(outdir::AbstractString; readonly::Bool=false)::Vector{AttachedStudy}
     result = AttachedStudy[]
     for log_path in find_log_tomls(outdir)
         attached = try
             info = read_log_toml(log_path)
             inferred = _infer_outdir(log_path)
             config_path = _resolve_config_for_attach(info, inferred)
-            vault = Vault(config_path; run=info.run, outdir=inferred, check_paths=false)
+            vault = Vault(
+                config_path;
+                run=info.run,
+                outdir=inferred,
+                check_paths=false,
+                readonly=readonly,
+            )
             AttachedStudy(vault, info, log_path)
         catch e
             @warn "Failed to attach log.toml — skipping" path = log_path exception = e

@@ -16,6 +16,7 @@ Wraps a `ConfigSpec` and resolves file paths under `outdir`.
                  `"default"`. Use distinct names to keep multi-phase
                  explorations separate (e.g. `"phase1"`, `"phase2_refined"`)
 - `path_formatter`: function `(DataKey, path_keys) -> String`
+- `readonly`:    when `true`, every write verb refuses (see below)
 
 # outdir resolution
 
@@ -52,6 +53,23 @@ Pass `path_formatter` to override both:
 
 A formatter given this way cannot be reproduced from log.toml alone, so DataVault warns.
 
+# Reading a run without committing it
+
+Construction is the only way to get a `Vault`, and it normally upserts the log.toml. That upsert is
+the discovery anchor: it also FREEZES the run's `path_keys`, so a tool whose contract is "count how
+many keys are left" has the effect "commit the schema" on a run that has not executed a key yet.
+
+`readonly=true` takes the validation without the write. An existing log.toml is still checked
+against the spec, a run that has none is not refused for it, and `save!`, `save_bin!`, `mark_done!`,
+`mark_running!`, `acquire_running!`, `touch_running!`, `refresh_running!`, `clear_running!`,
+`build_ledger`, `record_figure` and `cleanup_stale` all throw rather than write, so the flag is a
+check and not a label.
+
+```julia
+v = Vault("config.toml"; run="phase1", outdir="out/", readonly=true)
+count(k -> !is_done(v, k), ParamIO.expand(ParamIO.load("config.toml")))
+```
+
 # Path collision check
 
 Construction warns when two DISTINCT parameter points format to ONE directory — they would
@@ -66,6 +84,17 @@ struct Vault
     outdir::String
     run::String
     path_formatter::Function
+    readonly::Bool
+end
+
+function Vault(
+    config_path::AbstractString,
+    spec::ParamIO.ConfigSpec,
+    outdir::AbstractString,
+    run::AbstractString,
+    path_formatter::Function,
+)
+    return Vault(config_path, spec, outdir, run, path_formatter, false)
 end
 
 """
@@ -131,6 +160,7 @@ function Vault(
     outdir::Union{AbstractString,Nothing}=nothing,
     path_formatter::Union{Function,Nothing}=nothing,
     check_paths::Bool=true,
+    readonly::Bool=false,
 )
     spec = ParamIO.load(config_path)
 
@@ -145,15 +175,32 @@ function Vault(
 
     formatter = _resolve_formatter(path_formatter, spec, resolved, string(run))
 
-    vault = Vault(abspath(config_path), spec, resolved, string(run), formatter)
+    vault = Vault(abspath(config_path), spec, resolved, string(run), formatter, readonly)
 
     # log.toml upsert is the discovery anchor and validates path_keys against
     # any pre-existing entry — must run first so a conflicting run name fails
-    # before we touch the data subtree.
-    _save_log_toml(vault)
-    _save_config_snapshot(vault)
+    # before we touch the data subtree. A readonly vault takes the validation
+    # alone: the anchor is the run's key space, and a reader must not be the one
+    # to commit it.
+    if readonly
+        _validate_log_toml(vault)
+    else
+        _save_log_toml(vault)
+        _save_config_snapshot(vault)
+    end
     check_paths && _warn_on_path_collisions(vault)
     return vault
+end
+
+# Every write verb passes through here, so `readonly` is a check rather than a label.
+function _refuse_if_readonly(vault::Vault, verb::AbstractString)
+    vault.readonly && throw(
+        ArgumentError(
+            "$verb: this Vault was constructed with readonly=true. Construct it without " *
+            "readonly to write to run \"$(vault.run)\".",
+        ),
+    )
+    return nothing
 end
 
 # What this (project, run) was actually written with — `(scheme, precision)` — or `nothing`

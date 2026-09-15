@@ -168,7 +168,8 @@ hostname      = "ohtaka"
 | --- | --- |
 | `Vault(config; run="default", outdir, path_formatter)` | (study, run) に attach。log.toml + config_snapshot を upsert |
 | `DataVault.save!(vault, key, data)` | atomic write（NFS-safe） |
-| `DataVault.load(vault, key)` | JLD2 dict を返す |
+| `DataVault.load(vault, key)` | JLD2 dict を返す。ファイルが無ければ raise |
+| `DataVault.tryload(vault, key)` | 同じものを返すが、ファイルが無ければ `nothing` |
 | `DataVault.save_bin!` / `load_bin` | チェックポイント（HPC 用） |
 | `DataVault.keys(vault; status=:all/:done/:pending)` | DataKey 列挙 |
 | `is_done(vault, key)` / `mark_done!` / `mark_running!` | ステータス管理 |
@@ -183,12 +184,31 @@ hostname      = "ohtaka"
 | `attach(log_path)` | log.toml から writable な Vault を復元 |
 | `attach(outdir; project, run="default")` | discovery contract 経由で attach |
 | `open_all(outdir)` | 全 (study, run) を発見して attach。`Vector{AttachedStudy}` を返す |
+| `Vault(config; …, readonly=true)` / `attach(…; readonly=true)` / `open_all(…; readonly=true)` | log.toml を検証するが書かない。write verb は throw する |
 | `load_ledger(vault)` | ledger.csv を `Vector{Dict{String,String}}` で読む |
 | `build_master_ledger(outdir)` | 全 ledger を集約 + メタ列付与 |
 | `read_log_toml(path)` | log.toml を struct に変換（reader registry 経由） |
 | `find_log_tomls(outdir)` | `.datavault/*.log.toml` のパス列挙 |
 
 attach は通常の writable Vault を返すので、attach 後に新しい key を計算して `mark_done!` するような **計算再開** もシームレスに動作する。
+
+#### `readonly=true` — 読むだけの consumer が run を凍結しないために
+
+`Vault` の構築は log.toml を upsert する。これは discovery anchor であり、同時に run の
+`path_keys` を **凍結** する。よって「残りの key 数を数えるだけ」のスクリプトが、まだ 1 key も
+実行していない run に対して schema を commit してしまう。集計・進捗カウンタ・プロット側は
+`readonly=true` を使う:
+
+```julia
+v = Vault("config.toml"; run="phase1", outdir="out", readonly=true)
+count(k -> !is_done(v, k), DataVault.keys(v))
+```
+
+既存の log.toml があれば **検証はする**（`path_keys` が食い違えば従来どおり refuse）。無ければ
+refuse しない。`save!` / `save_bin!` / `mark_done!` / `mark_running!` / `acquire_running!` /
+`touch_running!` / `refresh_running!` / `clear_running!` / `build_ledger` / `record_figure` /
+`cleanup_stale` は
+throw するので、フラグはラベルではなく検査になっている。
 
 ### 並列ジョブ
 

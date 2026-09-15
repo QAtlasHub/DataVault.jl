@@ -31,6 +31,7 @@ Fields written: `jobid`, `completed`, `git_hash`, and optionally `tag_value`.
 `jobid` defaults to `SLURM_JOB_ID` env var, then current PID.
 """
 function mark_done!(vault::Vault, key::DataKey; jobid=nothing, tag_value=nothing)
+    _refuse_if_readonly(vault, "mark_done!")
     done = _done_file(vault, key)
     mkpath(dirname(done))
 
@@ -64,6 +65,7 @@ fields.  **Non-atomic overwrite** — for multi-master coordination use
 acquisition via POSIX `link()`.
 """
 function mark_running!(vault::Vault, key::DataKey)
+    _refuse_if_readonly(vault, "mark_running!")
     path = _running_file(vault, key)
     mkpath(dirname(path))
     now_str = Dates.format(Dates.now(), "yyyy-mm-ddTHH:MM:SS")
@@ -110,6 +112,7 @@ most one caller sees `:ok` / `:reclaimed`; the rest see `:busy`.
 - [`cleanup_stale`](@ref) — background reaper for crashed masters.
 """
 function acquire_running!(vault::Vault, key::DataKey; stale_after::Real=600.0)::Symbol
+    _refuse_if_readonly(vault, "acquire_running!")
     path = _running_file(vault, key)
     mkpath(dirname(path))
 
@@ -158,6 +161,7 @@ that [`cleanup_stale`](@ref) can distinguish live jobs from crashed ones.
 No-op if the `.running` file does not exist (already cleared or never created).
 """
 function touch_running!(vault::Vault, key::DataKey)
+    _refuse_if_readonly(vault, "touch_running!")
     path = _running_file(vault, key)
     isfile(path) || return nothing
     now_str = Dates.format(Dates.now(), "yyyy-mm-ddTHH:MM:SS")
@@ -191,6 +195,7 @@ Thin wrapper around [`touch_running!`](@ref) that also tells the caller
 whether the heartbeat update actually landed.
 """
 function refresh_running!(vault::Vault, key::DataKey)::Bool
+    _refuse_if_readonly(vault, "refresh_running!")
     path = _running_file(vault, key)
     isfile(path) || return false
     touch_running!(vault, key)
@@ -237,6 +242,7 @@ Remove the `.running` sentinel for `key`. Idempotent — safe to call when
 the file has already been removed (e.g. by [`mark_done!`](@ref)).
 """
 function clear_running!(vault::Vault, key::DataKey)
+    _refuse_if_readonly(vault, "clear_running!")
     path = _running_file(vault, key)
     isfile(path) && rm(path; force=true)
     return nothing

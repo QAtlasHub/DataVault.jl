@@ -1,0 +1,28 @@
+        - # util/snapshot.jl — config_snapshot.toml の保存と差分検知
+        - 
+        - """
+        -     _save_config_snapshot(vault)
+        - 
+        - On first call, copy the config TOML to
+        - `{outdir}/data/{project}/{run}/config_snapshot.toml`.
+        - On subsequent calls, warn (without overwriting) if the live config differs.
+        - 
+        - The snapshot lives next to the run's data so each run preserves the exact
+        - config it was launched with.
+        - """
+        9 function _save_config_snapshot(vault::Vault)
+        9     run_dir = _run_data_dir(vault)
+        9     snapshot_path = joinpath(run_dir, "config_snapshot.toml")
+        9     mkpath(run_dir)
+        - 
+        9     if !isfile(snapshot_path)
+        9         cp(vault.config_path, snapshot_path)
+        -     else
+        0         existing = TOML.parsefile(snapshot_path)
+        0         current = TOML.parsefile(vault.config_path)
+        0         if existing != current
+        0             @warn "Config has changed since the snapshot was taken — not overwriting" snapshot =
+        -                 snapshot_path
+        -         end
+        -     end
+        - end

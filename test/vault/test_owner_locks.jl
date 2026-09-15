@@ -112,6 +112,33 @@ end
     end
 end
 
+@testset "owner: an absent file is refused by every owner-aware verb" begin
+    with_ol() do v, k
+        tok = new_owner_token()
+        acquire_running!(v, k, tok)
+        clear_running!(v, k)                         # gone
+        @test !is_running(v, k)
+        @test running_owner(v, k) === nothing
+        @test refresh_running!(v, k, tok) == false
+        @test clear_running!(v, k, tok) == false
+    end
+end
+
+@testset "owner: a truncated .running is not treated as ours" begin
+    # A partial write from a crashed acquire has no `owner=` line, so it must read as unowned
+    # rather than as a match on whatever did land.
+    with_ol() do v, k
+        tok = new_owner_token()
+        acquire_running!(v, k, tok)
+        path = DataVault._running_file(v, k)
+        write(path, "pid=1\nstarted=2026-09-15T00:00:00\n")   # heartbeat and owner lost
+        @test running_owner(v, k) === nothing
+        @test refresh_running!(v, k, tok) == false
+        @test clear_running!(v, k, tok) == false
+        @test is_running(v, k)
+    end
+end
+
 @testset "owner: readonly still refuses the owner-aware forms" begin
     outdir = mktempdir()
     try

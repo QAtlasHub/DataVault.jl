@@ -140,15 +140,20 @@ The `owner=` token in the `.running` file, or `nothing` when the file is absent 
 token. A `.running` written before owner stamping, or by [`mark_running!`](@ref), has none.
 """
 function running_owner(vault::Vault, key::DataKey)::Union{String,Nothing}
-    path = _running_file(vault, key)
-    isfile(path) || return nothing
+    lines = _running_lines(vault, key)
+    lines === nothing && return nothing
+    i = findfirst(l -> startswith(l, "owner="), lines)
+    return i === nothing ? nothing : String(lines[i][7:end])
+end
+
+# The `.running` file's lines, or `nothing` when it cannot be read. Absent and unreadable are one
+# outcome on purpose: an owner-aware verb can prove ownership from neither.
+function _running_lines(vault::Vault, key::DataKey)::Union{Vector{String},Nothing}
     try
-        for line in eachline(path)
-            startswith(line, "owner=") && return String(line[7:end])
-        end
+        return readlines(_running_file(vault, key))
     catch
+        return nothing
     end
-    return nothing
 end
 
 """
@@ -268,26 +273,20 @@ a window of microseconds during a reclaim.
 
 The check is read-then-write and not atomic. A sibling reclaiming in the gap between the two is
 still possible; what this closes is the case where a reclaim has ALREADY happened, which is the one
-that lasts for the rest of the key.
+that lasts for the rest of the key. A file that cannot be read at all is `false` as well: absent
+and unreadable are both "not provably ours".
 """
 function refresh_running!(vault::Vault, key::DataKey, owner::AbstractString)::Bool
     _refuse_if_readonly(vault, "refresh_running!")
-    running_owner(vault, key) == owner || return false
-    path = _running_file(vault, key)
+    lines = _running_lines(vault, key)
+    lines === nothing && return false
+    any(l -> l == "owner=$(owner)", lines) || return false
+
     now_str = Dates.format(Dates.now(), "yyyy-mm-ddTHH:MM:SS")
-    try
-        lines = readlines(path)
-        # Re-read under the same guard: `readlines` is where a reclaim between the check above and
-        # this write becomes visible, and rewriting a file that is no longer ours is the one thing
-        # this method exists to avoid.
-        any(l -> l == "owner=$(owner)", lines) || return false
-        open(path, "w") do io
-            for line in lines
-                println(io, startswith(line, "heartbeat=") ? "heartbeat=$(now_str)" : line)
-            end
+    open(_running_file(vault, key), "w") do io
+        for line in lines
+            println(io, startswith(line, "heartbeat=") ? "heartbeat=$(now_str)" : line)
         end
-    catch
-        return false
     end
     return true
 end
@@ -354,11 +353,7 @@ from the owner-blind form is unbounded-to-microseconds, not to zero.
 function clear_running!(vault::Vault, key::DataKey, owner::AbstractString)::Bool
     _refuse_if_readonly(vault, "clear_running!")
     running_owner(vault, key) == owner || return false
-    try
-        rm(_running_file(vault, key); force=true)
-    catch
-        return false
-    end
+    rm(_running_file(vault, key); force=true)
     return true
 end
 

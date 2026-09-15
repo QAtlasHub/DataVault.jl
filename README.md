@@ -189,7 +189,8 @@ hostname      = "ohtaka"
 | `open_all(outdir)` | 全 (study, run) を発見して attach。`Vector{AttachedStudy}` を返す |
 | `Vault(config; …, readonly=true)` / `attach(…; readonly=true)` / `open_all(…; readonly=true)` | log.toml を検証するが書かない。write verb は throw する |
 | `load_ledger(vault)` | ledger.csv を `Vector{Dict{String,String}}` で読む |
-| `build_master_ledger(outdir)` | 全 ledger を集約 + メタ列付与 |
+| `build_master_ledger(outdir)` | 全 ledger を集約 + メタ列付与。source が食い違うと `@warn` |
+| `master_ledger_report(outdir)` | 同じ行に加えて `(; ok, columns, sources, collisions)` |
 | `read_log_toml(path)` | log.toml を struct に変換（reader registry 経由） |
 | `find_log_tomls(outdir)` | `.datavault/*.log.toml` のパス列挙 |
 

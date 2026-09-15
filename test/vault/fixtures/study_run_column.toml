@@ -1,0 +1,11 @@
+# A param literally named `run`, which is also a column build_master_ledger adds to every row.
+[study]
+project_name  = "collide_study"
+total_samples = 1
+outdir        = "out"
+
+[datavault]
+path_keys = ["run"]
+
+[[paramsets]]
+run = [7, 9]

@@ -50,7 +50,8 @@ export build_experiment_report, build_experiments_index, gather_code_versions
 export read_schema_record, check_schema_compat
 export new_experiment, build_narrative_index, experiment_template
 export read_log_toml, find_log_tomls    # log.toml discovery API
-export attach, open_all, load_ledger, build_master_ledger, AttachedStudy
+export attach, open_all, load_ledger, build_master_ledger, master_ledger_report
+export AttachedStudy
 
 # ── 依存順序 ─────────────────────────────────────────────────────────────────
 # paths.jl は vault.jl の Vault に依存

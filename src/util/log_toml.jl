@@ -202,6 +202,28 @@ function _log_toml_path(
     return joinpath(outdir, DATAVAULT_DIR_NAME, project, "$(run).log.toml")
 end
 
+"""
+    _validate_log_toml(vault) -> Union{String,Nothing}
+
+Refuse a run whose recorded `path_keys` differ from the spec's, and return its `created_at` so the
+writer can preserve it. `nothing` when the run has no log.toml yet, which is not a refusal: a run
+is allowed to be new.
+"""
+function _validate_log_toml(vault::Vault)::Union{String,Nothing}
+    log_path = _log_toml_path(vault.outdir, vault.spec.study.project_name, vault.run)
+    isfile(log_path) || return nothing
+    existing = read_log_toml(log_path)
+    if existing.path_keys != vault.spec.path_keys
+        error(
+            "log.toml conflict at $log_path: existing path_keys=" *
+            "$(existing.path_keys) differ from current path_keys=" *
+            "$(vault.spec.path_keys). " *
+            "If this is a new parameter exploration, use a different run name.",
+        )
+    end
+    return existing.created_at
+end
+
 function _save_log_toml(vault::Vault)::String
     project = vault.spec.study.project_name
     dv_dir = joinpath(vault.outdir, DATAVAULT_DIR_NAME)
@@ -219,20 +241,9 @@ function _save_log_toml(vault::Vault)::String
             vault.run
     end
 
-    created_at = if isfile(log_path)
-        existing = read_log_toml(log_path)
-        if existing.path_keys != vault.spec.path_keys
-            error(
-                "log.toml conflict at $log_path: existing path_keys=" *
-                "$(existing.path_keys) differ from current path_keys=" *
-                "$(vault.spec.path_keys). " *
-                "If this is a new parameter exploration, use a different run name.",
-            )
-        end
-        existing.created_at
-    else
-        Dates.format(Dates.now(), "yyyy-mm-ddTHH:MM:SS")
-    end
+    created_at = something(
+        _validate_log_toml(vault), Dates.format(Dates.now(), "yyyy-mm-ddTHH:MM:SS")
+    )
 
     layout = Dict(
         "data_dir" => relpath(_run_data_dir(vault), vault.outdir),

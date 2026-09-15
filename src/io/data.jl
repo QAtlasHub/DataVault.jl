@@ -5,10 +5,31 @@
 
 Load the JLD2 data file for `key`. Returns the stored dict.
 Raises an error if the file does not exist.
+
+Absence is the common case when walking a run that is still being acquired, and a `try`/`catch`
+around this is the expensive way to ask: guard with [`is_done`](@ref), or use [`tryload`](@ref),
+which returns `nothing` instead of raising.
 """
 function load(vault::Vault, key::DataKey; prefix::AbstractString="data")::Dict
     path = _data_file(vault, key; prefix=prefix)
     isfile(path) || error("Data file not found: $path")
+    return JLD2.load(path)
+end
+
+"""
+    DataVault.tryload(vault, key; prefix="data") -> Union{Dict,Nothing}
+
+The stored dict for `key`, or `nothing` when there is no file. [`load`](@ref) with absence as a
+value rather than an exception, for the scan-a-partial-vault case.
+
+Only absence is a `nothing`: a file that exists and cannot be read still raises, so a corrupt
+payload is not reported as a missing one.
+"""
+function tryload(
+    vault::Vault, key::DataKey; prefix::AbstractString="data"
+)::Union{Dict,Nothing}
+    path = _data_file(vault, key; prefix=prefix)
+    isfile(path) || return nothing
     return JLD2.load(path)
 end
 
@@ -20,6 +41,7 @@ Uses a tmp file + rename pattern safe on NFS.
 Does NOT automatically mark done — call `mark_done!` explicitly.
 """
 function save!(vault::Vault, key::DataKey, data::Dict; prefix::AbstractString="data")
+    _refuse_if_readonly(vault, "save!")
     path = _data_file(vault, key; prefix=prefix)
     mkpath(dirname(path))
     _atomic_jld2_write(path, data)
@@ -49,6 +71,7 @@ Atomically write a binary checkpoint.
 function save_bin!(
     vault::Vault, key::DataKey, data::Dict; prefix::AbstractString="checkpoint"
 )
+    _refuse_if_readonly(vault, "save_bin!")
     path = _bin_file(vault, key; prefix=prefix)
     mkpath(dirname(path))
     _atomic_jld2_write(path, data)

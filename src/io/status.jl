@@ -31,6 +31,7 @@ Fields written: `jobid`, `completed`, `git_hash`, and optionally `tag_value`.
 `jobid` defaults to `SLURM_JOB_ID` env var, then current PID.
 """
 function mark_done!(vault::Vault, key::DataKey; jobid=nothing, tag_value=nothing)
+    _refuse_if_readonly(vault, "mark_done!")
     done = _done_file(vault, key)
     mkpath(dirname(done))
 
@@ -64,6 +65,7 @@ fields.  **Non-atomic overwrite** — for multi-master coordination use
 acquisition via POSIX `link()`.
 """
 function mark_running!(vault::Vault, key::DataKey)
+    _refuse_if_readonly(vault, "mark_running!")
     path = _running_file(vault, key)
     mkpath(dirname(path))
     now_str = Dates.format(Dates.now(), "yyyy-mm-ddTHH:MM:SS")
@@ -108,8 +110,65 @@ most one caller sees `:ok` / `:reclaimed`; the rest see `:busy`.
 - [`mark_done!`](@ref) — remove `.running` and write `.done` on success.
 - [`clear_running!`](@ref) — release without marking done (failure paths).
 - [`cleanup_stale`](@ref) — background reaper for crashed masters.
+
+# Ownership
+
+This form leaves the lock UNOWNED, and the companions above are owner-blind: after a sibling
+reclaims, the previous holder's `refresh_running!` still returns `true` and its `clear_running!`
+still deletes, now against the reclaimer's file. Pass a [`new_owner_token`](@ref) to the
+three-argument methods to close both.
 """
 function acquire_running!(vault::Vault, key::DataKey; stale_after::Real=600.0)::Symbol
+    return acquire_running!(vault, key, ""; stale_after=stale_after)
+end
+
+"""
+    new_owner_token() -> String
+
+A token identifying one acquisition, as `"<host>:<pid>:<nonce>"`. The nonce is what makes it
+identify the ACQUISITION rather than the process: a master that loses a lock and later reacquires
+the same key must not be mistaken for its earlier self by a heartbeat still in flight.
+"""
+function new_owner_token()::String
+    return @sprintf("%s:%d:%08x", gethostname(), getpid(), rand(UInt32))
+end
+
+"""
+    running_owner(vault, key) -> Union{String,Nothing}
+
+The `owner=` token in the `.running` file, or `nothing` when the file is absent or carries no
+token. A `.running` written before owner stamping, or by [`mark_running!`](@ref), has none.
+"""
+function running_owner(vault::Vault, key::DataKey)::Union{String,Nothing}
+    lines = _running_lines(vault, key)
+    lines === nothing && return nothing
+    i = findfirst(l -> startswith(l, "owner="), lines)
+    return i === nothing ? nothing : String(lines[i][7:end])
+end
+
+# The `.running` file's lines, or `nothing` when it cannot be read. Absent and unreadable are one
+# outcome on purpose: an owner-aware verb can prove ownership from neither.
+function _running_lines(vault::Vault, key::DataKey)::Union{Vector{String},Nothing}
+    try
+        return readlines(_running_file(vault, key))
+    catch
+        return nothing
+    end
+end
+
+"""
+    acquire_running!(vault, key, owner; stale_after=600.0) -> Symbol
+
+[`acquire_running!`](@ref) stamping `owner=` into the `.running` file, so that
+[`refresh_running!`](@ref) and [`clear_running!`](@ref) can tell this acquisition's lock from the
+one a sibling took after reclaiming it. `owner` is normally [`new_owner_token`](@ref).
+
+Returns the same `:ok` / `:reclaimed` / `:busy` as the two-argument form.
+"""
+function acquire_running!(
+    vault::Vault, key::DataKey, owner::AbstractString; stale_after::Real=600.0
+)::Symbol
+    _refuse_if_readonly(vault, "acquire_running!")
     path = _running_file(vault, key)
     mkpath(dirname(path))
 
@@ -134,7 +193,9 @@ function acquire_running!(vault::Vault, key::DataKey; stale_after::Real=600.0)::
     now_str = Dates.format(Dates.now(), "yyyy-mm-ddTHH:MM:SS")
     tmp_name = @sprintf("%s.acq.%d.%x", basename(path), getpid(), rand(UInt32))
     tmp = joinpath(dirname(path), tmp_name)
-    write(tmp, "pid=$(getpid())\nstarted=$(now_str)\nheartbeat=$(now_str)\n")
+    body = "pid=$(getpid())\nstarted=$(now_str)\nheartbeat=$(now_str)\n"
+    isempty(owner) || (body *= "owner=$(owner)\n")
+    write(tmp, body)
 
     linked = try
         ccall(:link, Cint, (Cstring, Cstring), tmp, path) == 0
@@ -158,6 +219,7 @@ that [`cleanup_stale`](@ref) can distinguish live jobs from crashed ones.
 No-op if the `.running` file does not exist (already cleared or never created).
 """
 function touch_running!(vault::Vault, key::DataKey)
+    _refuse_if_readonly(vault, "touch_running!")
     path = _running_file(vault, key)
     isfile(path) || return nothing
     now_str = Dates.format(Dates.now(), "yyyy-mm-ddTHH:MM:SS")
@@ -191,10 +253,42 @@ Thin wrapper around [`touch_running!`](@ref) that also tells the caller
 whether the heartbeat update actually landed.
 """
 function refresh_running!(vault::Vault, key::DataKey)::Bool
+    _refuse_if_readonly(vault, "refresh_running!")
     path = _running_file(vault, key)
     isfile(path) || return false
     touch_running!(vault, key)
     return isfile(path)
+end
+
+"""
+    refresh_running!(vault, key, owner) -> Bool
+
+[`refresh_running!`](@ref) that first checks the file is still `owner`'s. Returns `false` and
+writes NOTHING when the on-disk `owner=` differs, is absent, or the file is gone, so a master that
+stalled past `stale_after` learns it lost the lock instead of stamping its own clock onto the
+reclaiming master's file.
+
+The owner-blind two-argument form cannot: it returns `false` only when the file is ABSENT, which is
+a window of microseconds during a reclaim.
+
+The check is read-then-write and not atomic. A sibling reclaiming in the gap between the two is
+still possible; what this closes is the case where a reclaim has ALREADY happened, which is the one
+that lasts for the rest of the key. A file that cannot be read at all is `false` as well: absent
+and unreadable are both "not provably ours".
+"""
+function refresh_running!(vault::Vault, key::DataKey, owner::AbstractString)::Bool
+    _refuse_if_readonly(vault, "refresh_running!")
+    lines = _running_lines(vault, key)
+    lines === nothing && return false
+    any(l -> l == "owner=$(owner)", lines) || return false
+
+    now_str = Dates.format(Dates.now(), "yyyy-mm-ddTHH:MM:SS")
+    open(_running_file(vault, key), "w") do io
+        for line in lines
+            println(io, startswith(line, "heartbeat=") ? "heartbeat=$(now_str)" : line)
+        end
+    end
+    return true
 end
 
 """
@@ -237,9 +331,30 @@ Remove the `.running` sentinel for `key`. Idempotent — safe to call when
 the file has already been removed (e.g. by [`mark_done!`](@ref)).
 """
 function clear_running!(vault::Vault, key::DataKey)
+    _refuse_if_readonly(vault, "clear_running!")
     path = _running_file(vault, key)
     isfile(path) && rm(path; force=true)
     return nothing
+end
+
+"""
+    clear_running!(vault, key, owner) -> Bool
+
+[`clear_running!`](@ref) that removes the file only when its `owner=` is `owner`. Returns whether
+it removed anything.
+
+The two-argument form deletes regardless of owner, so a master releasing AFTER losing its lock
+deletes the reclaiming master's live `.running` and re-opens double execution. An unstamped file is
+not removed either: it cannot be shown to be ours, and `stale_after` will reclaim it.
+
+Read-then-unlink, so the same non-atomic gap as [`refresh_running!`](@ref) applies. The difference
+from the owner-blind form is unbounded-to-microseconds, not to zero.
+"""
+function clear_running!(vault::Vault, key::DataKey, owner::AbstractString)::Bool
+    _refuse_if_readonly(vault, "clear_running!")
+    running_owner(vault, key) == owner || return false
+    rm(_running_file(vault, key); force=true)
+    return true
 end
 
 """

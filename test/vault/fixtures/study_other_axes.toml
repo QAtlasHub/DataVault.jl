@@ -1,0 +1,17 @@
+# A second study whose key space shares NO axis with study.toml, so its ledger.csv has a
+# different column set. Merging the two is the condition master_ledger_report exists to report.
+[study]
+project_name  = "other_study"
+total_samples = 1
+outdir        = "out"
+
+[datavault]
+path_keys = ["system.M", "model.h"]
+
+[[paramsets]]
+
+[paramsets.system]
+M = [3, 5]
+
+[paramsets.model]
+h = [0.25]

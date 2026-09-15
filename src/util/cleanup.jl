@@ -14,6 +14,7 @@ Pass `stale_after=0.0` to remove all `.running` files unconditionally
 (the pre-v0.4.1 behaviour).
 """
 function cleanup_stale(vault::Vault; stale_after::Real=600.0)::Int
+    _refuse_if_readonly(vault, "cleanup_stale")
     status_base = _run_status_dir(vault)
     isdir(status_base) || return 0
 

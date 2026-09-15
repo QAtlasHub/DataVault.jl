@@ -11,6 +11,7 @@ e.g. `Dict("plot_energy" => "scripts/analysis/plot_energy.jl")`.
 function record_figure(
     vault::Vault; study::AbstractString, scripts::Dict{String,String}=Dict{String,String}()
 )
+    _refuse_if_readonly(vault, "record_figure")
     figure_dir = joinpath(vault.outdir, "figure", study)
     mkpath(figure_dir)
 

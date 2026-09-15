@@ -1,0 +1,131 @@
+        - # Owner-stamped .running locks (#21): the two hazards the owner-blind API leaves open.
+        - 
+        - using DataVault, ParamIO, Test
+        - 
+        - const _OL_CONFIG = joinpath(@__DIR__, "fixtures", "study.toml")
+        - 
+        6 function with_ol(f)
+        6     outdir = mktempdir()
+        6     try
+        6         v = Vault(_OL_CONFIG; outdir=outdir)
+        6         f(v, DataVault.keys(v)[1])
+        -     finally
+        6         rm(outdir; recursive=true, force=true)
+        -     end
+        - end
+        - 
+        - @testset "owner: a token identifies the acquisition, not the process" begin
+        -     a, b = new_owner_token(), new_owner_token()
+        -     @test a != b                                   # same host, same pid
+        -     @test occursin(string(getpid()), a)
+        -     @test count(==(':'), a) == 2
+        - end
+        - 
+        - @testset "owner: acquire stamps it, and the 2-arg form does not" begin
+        -     with_ol() do v, k
+        1         tok = new_owner_token()
+        1         @test acquire_running!(v, k, tok) === :ok
+        1         @test running_owner(v, k) == tok
+        1         clear_running!(v, k)
+        - 
+        1         @test acquire_running!(v, k) === :ok
+        1         @test running_owner(v, k) === nothing       # unstamped, as before
+        1         clear_running!(v, k)
+        - 
+        1         @test running_owner(v, k) === nothing       # absent file
+        -     end
+        - end
+        - 
+        - @testset "owner: acquire returns the same symbols as before" begin
+        -     with_ol() do v, k
+        1         @test acquire_running!(v, k, new_owner_token()) === :ok
+        1         @test acquire_running!(v, k, new_owner_token()) === :busy
+        -         # Stale: reclaimable, and the reclaimer's token replaces the previous one.
+        1         b = new_owner_token()
+        1         @test acquire_running!(v, k, b; stale_after=0.0) === :reclaimed
+        1         @test running_owner(v, k) == b
+        -     end
+        - end
+        - 
+        - @testset "hazard 1: after a reclaim, the loser's refresh is false and writes nothing" begin
+        -     with_ol() do v, k
+        1         a = new_owner_token()
+        1         @test acquire_running!(v, k, a) === :ok
+        - 
+        1         b = new_owner_token()
+        1         @test acquire_running!(v, k, b; stale_after=0.0) === :reclaimed   # B takes it over
+        1         before = read(DataVault._running_file(v, k), String)
+        - 
+        -         # A's heartbeat, after losing. The file EXISTS, so the owner-blind form returns true and
+        -         # stamps A's clock onto B's file; the owner-aware form must not.
+        1         @test refresh_running!(v, k, a) == false
+        1         @test read(DataVault._running_file(v, k), String) == before
+        1         @test running_owner(v, k) == b
+        - 
+        -         # Control: the owner-blind form on the same state does the wrong thing, which is why the
+        -         # three-argument form exists rather than being a stylistic preference.
+        1         @test refresh_running!(v, k) == true
+        -     end
+        - end
+        - 
+        - @testset "hazard 2: after a reclaim, the loser's clear does not delete the winner's lock" begin
+        -     with_ol() do v, k
+        1         a = new_owner_token()
+        1         acquire_running!(v, k, a)
+        1         b = new_owner_token()
+        1         acquire_running!(v, k, b; stale_after=0.0)
+        - 
+        1         @test clear_running!(v, k, a) == false
+        2         @test is_running(v, k)                       # B's lock survives
+        1         @test running_owner(v, k) == b
+        - 
+        1         @test clear_running!(v, k, b) == true
+        2         @test !is_running(v, k)
+        - 
+        1         @test clear_running!(v, k, b) == false       # idempotent, reports it removed nothing
+        -     end
+        - end
+        - 
+        - @testset "owner: the holder's own refresh succeeds and moves the heartbeat" begin
+        -     with_ol() do v, k
+        1         tok = new_owner_token()
+        1         acquire_running!(v, k, tok)
+        1         t0 = running_heartbeat(v, k)
+        1         sleep(1.1)
+        1         @test refresh_running!(v, k, tok) == true
+        1         @test running_heartbeat(v, k) > t0
+        1         @test running_owner(v, k) == tok             # refresh preserves the stamp
+        -     end
+        - end
+        - 
+        - @testset "owner: an unstamped lock is neither refreshed nor cleared by a token holder" begin
+        -     # A `.running` from mark_running! or from a pre-owner version carries no token. It cannot be
+        -     # shown to be ours, so neither verb touches it; stale_after is what reclaims it.
+        -     with_ol() do v, k
+        1         mark_running!(v, k)
+        1         @test running_owner(v, k) === nothing
+        1         tok = new_owner_token()
+        1         @test refresh_running!(v, k, tok) == false
+        1         @test clear_running!(v, k, tok) == false
+        2         @test is_running(v, k)
+        1         @test acquire_running!(v, k, tok; stale_after=0.0) === :reclaimed
+        -     end
+        - end
+        - 
+        - @testset "owner: readonly still refuses the owner-aware forms" begin
+        -     outdir = mktempdir()
+        -     try
+        -         w = Vault(_OL_CONFIG; outdir=outdir)
+        -         k = DataVault.keys(w)[1]
+        -         tok = new_owner_token()
+        -         acquire_running!(w, k, tok)
+        - 
+        -         r = Vault(_OL_CONFIG; outdir=outdir, readonly=true)
+        -         @test_throws ArgumentError acquire_running!(r, k, tok)
+        -         @test_throws ArgumentError refresh_running!(r, k, tok)
+        -         @test_throws ArgumentError clear_running!(r, k, tok)
+        -         @test running_owner(r, k) == tok             # reading is not writing
+        -     finally
+        -         rm(outdir; recursive=true, force=true)
+        -     end
+        - end

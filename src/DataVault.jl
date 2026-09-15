@@ -12,7 +12,7 @@ src/
 ├── io/
 │   ├── atomic.jl        NFS-safe 原子的書き込み + git_hash
 │   ├── data.jl          load / save! / load_bin / save_bin!
-│   └── status.jl        is_done / mark_done! / mark_running!
+│   └── status.jl        is_done / mark_done! / mark_running! / owner-stamped locks
 ├── reporting/
 │   ├── ledger.jl        build_ledger
 │   └── figure.jl        record_figure (meta.toml)
@@ -43,13 +43,15 @@ export DataKey                          # re-export from ParamIO
 export is_done, mark_done!, mark_running!, touch_running!, running_heartbeat
 export clear_running!, is_running
 export acquire_running!, refresh_running!, running_age_secs
+export new_owner_token, running_owner
 export build_ledger, record_figure, cleanup_stale
 export archive_figure!, list_figure_history, restore_figure!
 export build_experiment_report, build_experiments_index, gather_code_versions
 export read_schema_record, check_schema_compat
 export new_experiment, build_narrative_index, experiment_template
 export read_log_toml, find_log_tomls    # log.toml discovery API
-export attach, open_all, load_ledger, build_master_ledger, AttachedStudy
+export attach, open_all, load_ledger, build_master_ledger, master_ledger_report
+export AttachedStudy
 
 # ── 依存順序 ─────────────────────────────────────────────────────────────────
 # paths.jl は vault.jl の Vault に依存

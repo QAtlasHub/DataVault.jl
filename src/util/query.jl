@@ -53,11 +53,16 @@ Config resolution order:
 The returned `Vault` is fully writable. Its constructor will idempotently
 upsert the log.toml, refreshing `[meta].datavault_version` and
 `datavault_git_hash`. `created_at` is preserved.
+
+`readonly=true` passes through to the constructor: the log.toml is validated but not rewritten, and
+the returned vault refuses the write verbs. Use it for aggregates, progress counters and plotting
+scripts, which otherwise leave a mark on every run they read.
 """
 function attach(
     path::AbstractString;
     project::Union{AbstractString,Nothing}=nothing,
     run::AbstractString="default",
+    readonly::Bool=false,
 )::Vault
     log_path = if project === nothing
         path
@@ -75,25 +80,37 @@ function attach(
     # No grid scan: `check_paths` asks "will this sweep overwrite itself", which is a question
     # about writing. Attaching is a read, and `open_all` attaches once per run — a colliding
     # study would otherwise re-warn on every discovery, forever.
-    return Vault(config_path; run=info.run, outdir=outdir, check_paths=false)
+    return Vault(
+        config_path; run=info.run, outdir=outdir, check_paths=false, readonly=readonly
+    )
 end
 
 """
-    open_all(outdir::AbstractString) -> Vector{AttachedStudy}
+    open_all(outdir::AbstractString; readonly=false) -> Vector{AttachedStudy}
 
 Discover every `*.log.toml` under `{outdir}/.datavault/` and attach to each.
 Broken log.toml files (unknown version, missing envelope, etc.) are logged
 as warnings and skipped so that iteration over a partially-corrupted
 outdir still yields the healthy studies.
+
+`readonly=true` attaches without writing. Discovery over an outdir touches every run it finds, so
+a counter or a plotter run against three runs that had never executed a key creates three log.toml
+files and freezes their key spaces.
 """
-function open_all(outdir::AbstractString)::Vector{AttachedStudy}
+function open_all(outdir::AbstractString; readonly::Bool=false)::Vector{AttachedStudy}
     result = AttachedStudy[]
     for log_path in find_log_tomls(outdir)
         attached = try
             info = read_log_toml(log_path)
             inferred = _infer_outdir(log_path)
             config_path = _resolve_config_for_attach(info, inferred)
-            vault = Vault(config_path; run=info.run, outdir=inferred, check_paths=false)
+            vault = Vault(
+                config_path;
+                run=info.run,
+                outdir=inferred,
+                check_paths=false,
+                readonly=readonly,
+            )
             AttachedStudy(vault, info, log_path)
         catch e
             @warn "Failed to attach log.toml — skipping" path = log_path exception = e
@@ -143,21 +160,105 @@ this per outdir and concatenate — DataVault itself is intentionally
 unaware of any higher-level layout like Vault's `apps/lib/dev` layers.
 """
 function build_master_ledger(outdir::AbstractString)::Vector{Dict{String,String}}
+    report = master_ledger_report(outdir)
+    report.ok || @warn(
+        "build_master_ledger merged sources that do not share a column set; rows from " *
+            "different runs carry different keys. Call `master_ledger_report` for the breakdown.",
+        outdir,
+        columns = report.columns,
+        ragged = [
+            (s.project_name, s.run, s.missing) for
+            s in report.sources if !isempty(s.missing)
+        ],
+    )
+    isempty(report.collisions) || @warn(
+        "build_master_ledger overwrote a ledger column with its own meta column of the same " *
+            "name; the original value is not in the merged rows.",
+        outdir,
+        collisions = report.collisions,
+    )
+    return report.rows
+end
+
+# The columns `build_master_ledger` adds to every row. A ledger whose own header carries one of
+# these loses it in the merge, which is why the report names them rather than only counting.
+const MASTER_META_COLUMNS = ("project_name", "run", "datavault_version", "log_toml")
+
+"""
+    master_ledger_report(outdir) -> NamedTuple
+
+[`build_master_ledger`](@ref)'s rows together with whether the sources were compatible:
+
+    (; rows, ok, columns, sources, collisions)
+
+- `columns`: the union of every contributing ledger's columns, sorted.
+- `sources`: one `(; project_name, run, log_toml, nrows, columns, missing)` per contributing run,
+  where `missing` is the union columns that run's ledger does not have.
+- `collisions`: `(; project_name, run, column)` for each ledger column shadowed by one of the meta
+  columns the merge adds.
+- `ok`: every source has the full column set and nothing collided.
+
+The schema that decides whether a merge is sound here is the CSV COLUMN SET, not `schema.toml`:
+`build_ledger` derives its columns from the run's own params, so two runs whose key spaces differ
+produce rows that are not the same shape. `check_schema_compat` answers a different question, which
+is whether ONE run satisfies a reader's expectations.
+"""
+function master_ledger_report(outdir::AbstractString)
     rows = Vector{Dict{String,String}}()
-    for attached in open_all(outdir)
+    sources = Vector{
+        @NamedTuple{
+            project_name::String,
+            run::String,
+            log_toml::String,
+            nrows::Int,
+            columns::Vector{String},
+            missing::Vector{String},
+        }
+    }()
+    collisions = Vector{@NamedTuple{project_name::String,run::String,column::String}}()
+    raw = Vector{Tuple{String,String,String,Vector{String},Int}}()
+
+    for attached in open_all(outdir; readonly=true)
         local_rows = load_ledger(attached.vault)
         isempty(local_rows) && continue
         log_rel = relpath(attached.log_path, outdir)
+        project = attached.info.project_name
+        run = attached.info.run
+
+        cols = sort!(unique!(String[c for row in local_rows for c in Base.keys(row)]))
+        push!(raw, (project, run, log_rel, cols, length(local_rows)))
+        for c in cols
+            c in MASTER_META_COLUMNS &&
+                push!(collisions, (; project_name=project, run=run, column=c))
+        end
+
         for row in local_rows
             merged = copy(row)
-            merged["project_name"] = attached.info.project_name
-            merged["run"] = attached.info.run
+            merged["project_name"] = project
+            merged["run"] = run
             merged["datavault_version"] = attached.info.datavault_version
             merged["log_toml"] = log_rel
             push!(rows, merged)
         end
     end
-    return rows
+
+    union_cols = sort!(unique!(String[c for r in raw for c in r[4]]))
+    for (project, run, log_rel, cols, n) in raw
+        push!(
+            sources,
+            (;
+                project_name=project,
+                run=run,
+                log_toml=log_rel,
+                nrows=n,
+                columns=cols,
+                missing=String[c for c in union_cols if !(c in cols)],
+            ),
+        )
+    end
+
+    ok = isempty(collisions) && all(s -> isempty(s.missing), sources)
+    return (; rows, ok, columns=union_cols, sources, collisions)
 end
 
 # ── helpers ───────────────────────────────────────────────────────────────────

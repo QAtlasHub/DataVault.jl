@@ -7,6 +7,7 @@ Scan all `.done` files and write `ledger.csv` under the project data directory.
 Returns the path to the written file.
 """
 function build_ledger(vault::Vault)::String
+    _refuse_if_readonly(vault, "build_ledger")
     done_keys = keys(vault; status=:done)::Vector{DataKey}
 
     run_dir = _run_data_dir(vault)

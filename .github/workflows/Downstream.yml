@@ -1,0 +1,47 @@
+name: Downstream
+
+# This package sits in the middle of a three-layer stack (ParamIO -> DataVault -> SweepRunner), and
+# nothing here ran the layer above it. A change that breaks SweepRunner was found by reading, or by
+# a downstream CI run some days after release.
+#
+# The job resolves THIS pull request's DataVault under SweepRunner and runs SweepRunner's own suite
+# against it. That suite already exercises all three layers, so there is no separate integration
+# fixture to keep in step with them.
+on: { pull_request: {} }
+
+permissions:
+  contents: read
+
+jobs:
+  downstream:
+    name: ${{ matrix.pkg }}
+    # Hosted on purpose: public repositories bill no minutes for it, and the self-hosted pool is
+    # core-pinned and shared with work that cannot move.
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { repo: SweepRunner.jl, pkg: SweepRunner }
+    steps:
+      - uses: actions/checkout@v7
+        with: { path: upstream }
+      - uses: actions/checkout@v7
+        with:
+          repository: QAtlasHub/${{ matrix.repo }}
+          path: downstream
+      - uses: julia-actions/setup-julia@v3
+        with: { version: '1' }
+      - uses: julia-actions/cache@v3
+      - name: Run ${{ matrix.pkg }}'s suite against this pull request
+        shell: julia --color=yes {0}
+        run: |
+          using Pkg
+          # A temp env, never the downstream checkout's own Project.toml: `develop` rewrites
+          # `[sources]` in whatever project is active, and a rewritten tracked file is a
+          # different test than the one that was asked for.
+          Pkg.activate(; temp = true)
+          Pkg.develop([
+              PackageSpec(; path = "upstream"), PackageSpec(; path = "downstream")
+          ])
+          Pkg.test("${{ matrix.pkg }}")

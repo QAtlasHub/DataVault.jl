@@ -168,10 +168,14 @@ hostname      = "ohtaka"
 | --- | --- |
 | `Vault(config; run="default", outdir, path_formatter)` | (study, run) に attach。log.toml + config_snapshot を upsert |
 | `DataVault.save!(vault, key, data)` | atomic write（NFS-safe） |
-| `DataVault.load(vault, key)` | JLD2 dict を返す |
+| `DataVault.load(vault, key)` | JLD2 dict を返す。ファイルが無ければ raise |
+| `DataVault.tryload(vault, key)` | 同じものを返すが、ファイルが無ければ `nothing` |
 | `DataVault.save_bin!` / `load_bin` | チェックポイント（HPC 用） |
 | `DataVault.keys(vault; status=:all/:done/:pending)` | DataKey 列挙 |
 | `is_done(vault, key)` / `mark_done!` / `mark_running!` | ステータス管理 |
+| `acquire_running!(vault, key[, owner])` | POSIX `link()` による排他取得。`owner` を渡すと `.running` に刻む |
+| `refresh_running!(vault, key[, owner])` / `clear_running!(vault, key[, owner])` | `owner` 付きは所有者が一致しない限り書かない・消さない |
+| `new_owner_token()` / `running_owner(vault, key)` | 取得を識別するトークンの生成と読み出し |
 | `build_ledger(vault)` | `.done` を集約して `ledger.csv` を生成 |
 | `record_figure(vault; study, scripts)` | figure provenance の `meta.toml` を出力 |
 | `cleanup_stale(vault)` | 残存した `.running` を一掃 |
@@ -183,12 +187,32 @@ hostname      = "ohtaka"
 | `attach(log_path)` | log.toml から writable な Vault を復元 |
 | `attach(outdir; project, run="default")` | discovery contract 経由で attach |
 | `open_all(outdir)` | 全 (study, run) を発見して attach。`Vector{AttachedStudy}` を返す |
+| `Vault(config; …, readonly=true)` / `attach(…; readonly=true)` / `open_all(…; readonly=true)` | log.toml を検証するが書かない。write verb は throw する |
 | `load_ledger(vault)` | ledger.csv を `Vector{Dict{String,String}}` で読む |
-| `build_master_ledger(outdir)` | 全 ledger を集約 + メタ列付与 |
+| `build_master_ledger(outdir)` | 全 ledger を集約 + メタ列付与。source が食い違うと `@warn` |
+| `master_ledger_report(outdir)` | 同じ行に加えて `(; ok, columns, sources, collisions)` |
 | `read_log_toml(path)` | log.toml を struct に変換（reader registry 経由） |
 | `find_log_tomls(outdir)` | `.datavault/*.log.toml` のパス列挙 |
 
 attach は通常の writable Vault を返すので、attach 後に新しい key を計算して `mark_done!` するような **計算再開** もシームレスに動作する。
+
+#### `readonly=true` — 読むだけの consumer が run を凍結しないために
+
+`Vault` の構築は log.toml を upsert する。これは discovery anchor であり、同時に run の
+`path_keys` を **凍結** する。よって「残りの key 数を数えるだけ」のスクリプトが、まだ 1 key も
+実行していない run に対して schema を commit してしまう。集計・進捗カウンタ・プロット側は
+`readonly=true` を使う:
+
+```julia
+v = Vault("config.toml"; run="phase1", outdir="out", readonly=true)
+count(k -> !is_done(v, k), DataVault.keys(v))
+```
+
+既存の log.toml があれば **検証はする**（`path_keys` が食い違えば従来どおり refuse）。無ければ
+refuse しない。`save!` / `save_bin!` / `mark_done!` / `mark_running!` / `acquire_running!` /
+`touch_running!` / `refresh_running!` / `clear_running!` / `build_ledger` / `record_figure` /
+`cleanup_stale` は
+throw するので、フラグはラベルではなく検査になっている。
 
 ### 並列ジョブ
 
@@ -199,6 +223,28 @@ attach は通常の writable Vault を返すので、attach 後に新しい key 
 - 各ジョブが別の DataKey を担当している限り、データファイルは衝突しない
 
 ---
+
+#### `.running` の所有者スタンプ
+
+`acquire_running!(vault, key)` はロックを **無所有** で作る。この形だと、stale 判定で sibling が
+reclaim したあと、元の保持者は自分が負けたことを知れない:
+
+| | owner 無し | `owner` 付き |
+|---|---|---|
+| 負けた側の `refresh_running!` | `true`（reclaim 側の heartbeat を上書きする） | `false`（何も書かない） |
+| 負けた側の `clear_running!` | reclaim 側のロックを **消す** | 何もしない |
+
+```julia
+tok = DataVault.new_owner_token()
+acq = DataVault.acquire_running!(vault, key, tok; stale_after=600.0)
+acq === :busy && return
+...
+DataVault.refresh_running!(vault, key, tok) || return   # 負けたら止まる
+DataVault.clear_running!(vault, key, tok)               # 自分のものだけ消す
+```
+
+2引数の形は従来どおり残してある。owner 検査は read-then-write なので、その隙間での reclaim までは
+閉じない。閉じるのは「reclaim が **すでに起きている**」場合、つまりキーの残り時間ずっと続く方。
 
 ## カスタマイズ
 

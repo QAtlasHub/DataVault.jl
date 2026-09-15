@@ -173,6 +173,9 @@ hostname      = "ohtaka"
 | `DataVault.save_bin!` / `load_bin` | チェックポイント（HPC 用） |
 | `DataVault.keys(vault; status=:all/:done/:pending)` | DataKey 列挙 |
 | `is_done(vault, key)` / `mark_done!` / `mark_running!` | ステータス管理 |
+| `acquire_running!(vault, key[, owner])` | POSIX `link()` による排他取得。`owner` を渡すと `.running` に刻む |
+| `refresh_running!(vault, key[, owner])` / `clear_running!(vault, key[, owner])` | `owner` 付きは所有者が一致しない限り書かない・消さない |
+| `new_owner_token()` / `running_owner(vault, key)` | 取得を識別するトークンの生成と読み出し |
 | `build_ledger(vault)` | `.done` を集約して `ledger.csv` を生成 |
 | `record_figure(vault; study, scripts)` | figure provenance の `meta.toml` を出力 |
 | `cleanup_stale(vault)` | 残存した `.running` を一掃 |
@@ -219,6 +222,28 @@ throw するので、フラグはラベルではなく検査になっている�
 - 各ジョブが別の DataKey を担当している限り、データファイルは衝突しない
 
 ---
+
+#### `.running` の所有者スタンプ
+
+`acquire_running!(vault, key)` はロックを **無所有** で作る。この形だと、stale 判定で sibling が
+reclaim したあと、元の保持者は自分が負けたことを知れない:
+
+| | owner 無し | `owner` 付き |
+|---|---|---|
+| 負けた側の `refresh_running!` | `true`（reclaim 側の heartbeat を上書きする） | `false`（何も書かない） |
+| 負けた側の `clear_running!` | reclaim 側のロックを **消す** | 何もしない |
+
+```julia
+tok = DataVault.new_owner_token()
+acq = DataVault.acquire_running!(vault, key, tok; stale_after=600.0)
+acq === :busy && return
+...
+DataVault.refresh_running!(vault, key, tok) || return   # 負けたら止まる
+DataVault.clear_running!(vault, key, tok)               # 自分のものだけ消す
+```
+
+2引数の形は従来どおり残してある。owner 検査は read-then-write なので、その隙間での reclaim までは
+閉じない。閉じるのは「reclaim が **すでに起きている**」場合、つまりキーの残り時間ずっと続く方。
 
 ## カスタマイズ
 

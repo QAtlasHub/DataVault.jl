@@ -113,6 +113,7 @@ function open_all(outdir::AbstractString; readonly::Bool=false)::Vector{Attached
             )
             AttachedStudy(vault, info, log_path)
         catch e
+            e isa InterruptException && rethrow()
             @warn "Failed to attach log.toml — skipping" path = log_path exception = e
             continue
         end
@@ -177,6 +178,13 @@ function build_master_ledger(outdir::AbstractString)::Vector{Dict{String,String}
         outdir,
         collisions = report.collisions,
     )
+    report.unattached == 0 || @warn(
+        "build_master_ledger could not attach every study it discovered; the merged rows are a " *
+            "SUBSET and nothing in them says so.",
+        outdir,
+        unattached = report.unattached,
+        discovered = report.discovered,
+    )
     return report.rows
 end
 
@@ -189,14 +197,17 @@ const MASTER_META_COLUMNS = ("project_name", "run", "datavault_version", "log_to
 
 [`build_master_ledger`](@ref)'s rows together with whether the sources were compatible:
 
-    (; rows, ok, columns, sources, collisions)
+    (; rows, ok, columns, sources, collisions, unattached, discovered)
 
 - `columns`: the union of every contributing ledger's columns, sorted.
 - `sources`: one `(; project_name, run, log_toml, nrows, columns, missing)` per contributing run,
   where `missing` is the union columns that run's ledger does not have.
 - `collisions`: `(; project_name, run, column)` for each ledger column shadowed by one of the meta
   columns the merge adds.
-- `ok`: every source has the full column set and nothing collided.
+- `unattached`, `discovered`: how many `log.toml` files were found, and how many could not be
+  opened. A study that fails to attach contributes no rows and no `sources` entry, so without this
+  a half-readable outdir reports the same as a complete one.
+- `ok`: every source has the full column set, nothing collided, and nothing failed to attach.
 
 The schema that decides whether a merge is sound here is the CSV COLUMN SET, not `schema.toml`:
 `build_ledger` derives its columns from the run's own params, so two runs whose key spaces differ
@@ -204,6 +215,7 @@ produce rows that are not the same shape. `check_schema_compat` answers a differ
 is whether ONE run satisfies a reader's expectations.
 """
 function master_ledger_report(outdir::AbstractString)
+    discovered = length(find_log_tomls(outdir))
     rows = Vector{Dict{String,String}}()
     sources = Vector{
         @NamedTuple{
@@ -218,7 +230,8 @@ function master_ledger_report(outdir::AbstractString)
     collisions = Vector{@NamedTuple{project_name::String,run::String,column::String}}()
     raw = Vector{Tuple{String,String,String,Vector{String},Int}}()
 
-    for attached in open_all(outdir; readonly=true)
+    attached_studies = open_all(outdir; readonly=true)
+    for attached in attached_studies
         local_rows = load_ledger(attached.vault)
         isempty(local_rows) && continue
         log_rel = relpath(attached.log_path, outdir)
@@ -257,8 +270,9 @@ function master_ledger_report(outdir::AbstractString)
         )
     end
 
-    ok = isempty(collisions) && all(s -> isempty(s.missing), sources)
-    return (; rows, ok, columns=union_cols, sources, collisions)
+    unattached = discovered - length(attached_studies)
+    ok = isempty(collisions) && all(s -> isempty(s.missing), sources) && unattached == 0
+    return (; rows, ok, columns=union_cols, sources, collisions, unattached, discovered)
 end
 
 # ── helpers ───────────────────────────────────────────────────────────────────

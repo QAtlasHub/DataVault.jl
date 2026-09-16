@@ -296,7 +296,10 @@ function _atomic_toml_write(path::AbstractString, data::Dict)
         open(tmp, "w") do io
             return TOML.print(io, data)
         end
-        mv(tmp, path; force=true)
+        # One step or none: a log.toml that is briefly ABSENT reads as an unattachable study to
+        # `master_ledger_report`, which counts exactly that.
+        _rename_into_place(tmp, path) ||
+            error("rename($tmp, $path) failed: ", Base.Libc.strerror(Base.Libc.errno()))
     catch e
         isfile(tmp) && rm(tmp; force=true)
         rethrow(e)

@@ -34,7 +34,16 @@ function mark_done!(vault::Vault, key::DataKey; jobid=nothing, tag_value=nothing
     _refuse_if_readonly(vault, "mark_done!")
     done = _done_file(vault, key)
     mkpath(dirname(done))
+    write(done, _done_body(vault, key; jobid=jobid, tag_value=tag_value))
+    running = _running_file(vault, key)
+    isfile(running) && rm(running; force=true)
+    return nothing
+end
 
+# Everything a `.done` records, built BEFORE anything is written. `_git_hash` spawns a `git`
+# subprocess, so leaving it between an ownership check and the act would make that gap a
+# subprocess wide.
+function _done_body(vault::Vault, key::DataKey; jobid=nothing, tag_value=nothing)::String
     jobid_str = if jobid !== nothing
         string(jobid)
     elseif haskey(ENV, "SLURM_JOB_ID")
@@ -42,18 +51,53 @@ function mark_done!(vault::Vault, key::DataKey; jobid=nothing, tag_value=nothing
     else
         string(getpid())
     end
-
-    completed = Dates.format(Dates.now(), "yyyy-mm-ddTHH:MM:SS")
-    git_hash = _git_hash(vault.config_path)
-
-    lines = ["jobid=$jobid_str", "completed=$completed", "git_hash=$git_hash"]
+    lines = [
+        "jobid=$jobid_str",
+        "completed=$(Dates.format(Dates.now(), "yyyy-mm-ddTHH:MM:SS"))",
+        "git_hash=$(_git_hash(vault.config_path))",
+    ]
     tag_value !== nothing && push!(lines, "tag_value=$tag_value")
+    return join(lines, "\n") * "\n"
+end
 
-    write(done, join(lines, "\n") * "\n")
+"""
+    mark_done!(vault, key, owner; jobid=nothing, tag_value=nothing) -> Bool
 
+[`mark_done!`](@ref) that refuses unless the `.running` lock is still `owner`'s, writing neither
+`.done` nor the deletion when it is not.
+
+The check is repeated immediately before each write, so the gap is a syscall rather than the
+`mkpath` plus `git` subprocess that delegating to the two-argument form would put there. It is
+still a gap: a reclaim inside it is not detected, and an inode number the filesystem has recycled
+reads as a match. This narrows the hazard; it does not remove it.
+
+The two-argument form removes whatever `.running` is there and commits its `.done` regardless of
+who holds the lock. A master that stalled past `stale_after`, lost the key to a sibling, and then
+finished its own now-superseded computation therefore deletes the SIBLING's live lock and commits
+over it. No race is needed for that, only a slow key, so a per-key loop that ends in `mark_done!`
+wants this form.
+
+Returns whether it committed.
+"""
+function mark_done!(
+    vault::Vault, key::DataKey, owner::AbstractString; jobid=nothing, tag_value=nothing
+)::Bool
+    _refuse_if_readonly(vault, "mark_done!")
     running = _running_file(vault, key)
-    isfile(running) && rm(running; force=true)
-    return nothing
+    lines, ino = _read_running(running)
+    any(l -> l == "owner=$(owner)", lines) || return false
+
+    # Built first, so the re-check below is adjacent to the writes rather than a `git` subprocess
+    # away from them. Delegating to the two-argument form would put every filesystem operation it
+    # does between the check and its owner-blind `rm`.
+    body = _done_body(vault, key; jobid=jobid, tag_value=tag_value)
+    done = _done_file(vault, key)
+    mkpath(dirname(done))
+    _still_inode(running, ino) || return false
+    write(done, body)
+    # Cleanup, after the commit above already decided the answer: a fault here must not replace it.
+    _still_inode(running, ino) && _rm_quietly(running)
+    return true
 end
 
 """
@@ -133,6 +177,77 @@ function new_owner_token()::String
     return @sprintf("%s:%d:%08x", gethostname(), getpid(), rand(UInt32))
 end
 
+# `close` can throw even on a descriptor opened for reading: a stale NFS handle surfaces there. A
+# verb that promises a `Bool` must not let that escape, and a `finally close(io)` is a SIBLING of
+# the local `catch`, so it would.
+function _close_quietly(io::IO)
+    try
+        close(io)
+    catch e
+        e isa InterruptException && rethrow()
+        @warn "closing a .running descriptor failed" exception = (e, catch_backtrace())
+    end
+    return nothing
+end
+
+# The unlink half of the same hazard. `force=true` swallows only ENOENT, so a read-only directory
+# or an NFS fault still throws, and from a `finally` that throw REPLACES the value the verb had
+# already decided to return. Used only where the unlink is cleanup AFTER the decision is made.
+function _rm_quietly(path::AbstractString)
+    try
+        rm(path; force=true)
+    catch e
+        e isa InterruptException && rethrow()
+        @warn "removing a lock file failed; it will be reclaimed once stale" path exception = (
+            e, catch_backtrace()
+        )
+    end
+    return nothing
+end
+
+# `.running`'s lines and the inode they were read from, through ONE descriptor so the inode
+# describes exactly the bytes in `lines`. `stat(io)` and never `stat(path)`: the name can be
+# relinked to a reclaimer's file between the open and the stat, and re-resolving it would record
+# the WINNER's inode as if it were ours, which is the check this exists to support.
+#
+# A failed open and a fault mid-read are both "no lines, no inode". Every caller's own owner check
+# reads that as "not ours" before the inode is used.
+function _read_running(path::AbstractString)::Tuple{Vector{String},Union{UInt64,Nothing}}
+    io = try
+        open(path, "r")
+    catch e
+        e isa InterruptException && rethrow()
+        return (String[], nothing)
+    end
+    try
+        return (readlines(io), stat(io).inode)
+    catch e
+        e isa InterruptException && rethrow()
+        return (String[], nothing)
+    finally
+        _close_quietly(io)
+    end
+end
+
+"""
+    _still_inode(path, ino) -> Bool
+
+Whether `path` still resolves to the inode a token was read from. A reclaim publishes by unlinking
+the name and `link`ing a new file onto it, so this is what stops a verb from acting on the file
+that REPLACED the one it inspected. Unreadable counts as "no", since the answer cannot be shown.
+"""
+function _still_inode(path::AbstractString, ino::Union{UInt64,Nothing})::Bool
+    # `stat` on a missing path does not throw: it returns a zeroed struct. So a `UInt64(0)` standing
+    # for "we could not read it" would COMPARE EQUAL to a vanished file and pass this guard.
+    ino === nothing && return false
+    try
+        return stat(path).inode == ino
+    catch e
+        e isa InterruptException && rethrow()
+        return false
+    end
+end
+
 """
     running_owner(vault, key) -> Union{String,Nothing}
 
@@ -151,7 +266,8 @@ end
 function _running_lines(vault::Vault, key::DataKey)::Union{Vector{String},Nothing}
     try
         return readlines(_running_file(vault, key))
-    catch
+    catch e
+        e isa InterruptException && rethrow()
         return nothing
     end
 end
@@ -183,7 +299,13 @@ function acquire_running!(
         try
             rm(path; force=true)
             reclaimed = true
-        catch
+        catch e
+            e isa InterruptException && rethrow()
+            # `force=true` does not throw for "already gone", so this is a real fault. Reported
+            # because a persistent one returns `:busy` forever, which reads as healthy contention.
+            @warn "stale .running could not be reclaimed" path exception = (
+                e, catch_backtrace()
+            )
             return :busy
         end
     end
@@ -199,12 +321,13 @@ function acquire_running!(
 
     linked = try
         ccall(:link, Cint, (Cstring, Cstring), tmp, path) == 0
-    catch
+    catch e
+        e isa InterruptException && rethrow()
         false
     end
     # Always unlink the tmp path.  On success, the inode stays alive
     # through the `path` hardlink; on failure, the tmp file is purged.
-    rm(tmp; force=true)
+    _rm_quietly(tmp)
 
     return linked ? (reclaimed ? :reclaimed : :ok) : :busy
 end
@@ -234,8 +357,15 @@ function touch_running!(vault::Vault, key::DataKey)
                 end
             end
         end
-    catch
-        # .running may have been removed by another master; swallow
+    catch e
+        e isa InterruptException && rethrow()
+        # A removal by another master is ordinary and silent. Anything else means the heartbeat
+        # this was called to write did not land, and if the truncating `open` had already run, the
+        # file is now missing it or half-written.
+        isfile(path) &&
+            @warn "heartbeat write failed; .running may be truncated" path exception = (
+                e, catch_backtrace()
+            )
     end
     return nothing
 end
@@ -268,25 +398,46 @@ writes NOTHING when the on-disk `owner=` differs, is absent, or the file is gone
 stalled past `stale_after` learns it lost the lock instead of stamping its own clock onto the
 reclaiming master's file.
 
-The owner-blind two-argument form cannot: it returns `false` only when the file is ABSENT, which is
-a window of microseconds during a reclaim.
+The owner-blind two-argument form returns `false` only when the file is ABSENT, which is a window
+of microseconds during a reclaim.
 
-The check is read-then-write and not atomic. A sibling reclaiming in the gap between the two is
-still possible; what this closes is the case where a reclaim has ALREADY happened, which is the one
-that lasts for the rest of the key. A file that cannot be read at all is `false` as well: absent
-and unreadable are both "not provably ours".
+The rewrite goes to a temp file and is `rename(2)`d into place, and only while the name still
+carries the inode the token was read from. A write that fails partway therefore leaves the lock
+untouched, rather than owned by nobody, refreshable by nobody, and fresh by mtime until
+`stale_after` expires.
+
+The inode check is not atomic, and an inode number the filesystem has recycled reads as a match, so
+a reclaim can still slip through. This narrows the hazard; it does not remove it.
+
+A file that cannot be read at all is `false` as well: absent and unreadable are both "not provably
+ours".
 """
 function refresh_running!(vault::Vault, key::DataKey, owner::AbstractString)::Bool
     _refuse_if_readonly(vault, "refresh_running!")
-    lines = _running_lines(vault, key)
-    lines === nothing && return false
+    now_str = Dates.format(Dates.now(), "yyyy-mm-ddTHH:MM:SS")
+    path = _running_file(vault, key)
+    lines, ino = _read_running(path)       # absent or unreadable: not provably ours
     any(l -> l == "owner=$(owner)", lines) || return false
 
-    now_str = Dates.format(Dates.now(), "yyyy-mm-ddTHH:MM:SS")
-    open(_running_file(vault, key), "w") do io
-        for line in lines
-            println(io, startswith(line, "heartbeat=") ? "heartbeat=$(now_str)" : line)
+    # Written to a temp file and renamed, never truncated in place. A write that fails partway
+    # through an in-place rewrite leaves a lock owned by nobody, refreshable by nobody, and fresh
+    # by mtime until `stale_after`; `rename(2)` either replaces the file whole or does nothing.
+    tmp = @sprintf("%s.hb.%d.%x", path, getpid(), rand(UInt32))
+    try
+        open(tmp, "w") do out
+            for line in lines
+                println(out, startswith(line, "heartbeat=") ? "heartbeat=$(now_str)" : line)
+            end
         end
+        # Only if the name still carries the inode our token came from: a reclaim since the read
+        # relinked it, and renaming onto that would destroy the winner's lock.
+        _still_inode(path, ino) || return false
+        _rename_into_place(tmp, path) || return false
+    catch e
+        e isa InterruptException && rethrow()
+        return false
+    finally
+        _rm_quietly(tmp)
     end
     return true
 end
@@ -319,7 +470,8 @@ function running_heartbeat(vault::Vault, key::DataKey)::Union{DateTime,Nothing}
                 return Dates.DateTime(line[11:end], "yyyy-mm-ddTHH:MM:SS")
             end
         end
-    catch
+    catch e
+        e isa InterruptException && rethrow()
     end
     return nothing
 end
@@ -347,13 +499,27 @@ The two-argument form deletes regardless of owner, so a master releasing AFTER l
 deletes the reclaiming master's live `.running` and re-opens double execution. An unstamped file is
 not removed either: it cannot be shown to be ours, and `stale_after` will reclaim it.
 
-Read-then-unlink, so the same non-atomic gap as [`refresh_running!`](@ref) applies. The difference
-from the owner-blind form is unbounded-to-microseconds, not to zero.
+The unlink is guarded by the INODE the token was read from, not by the path alone, so a name
+relinked to the reclaimer's file since the read is left alone.
+
+A narrowing, not a guarantee, in two ways: `stat`-then-unlink is not atomic, and an inode NUMBER
+the filesystem has recycled onto the reclaimer's new file reads as a match. The owner-blind form
+has no guard at all in the other direction, because it always deletes.
 """
 function clear_running!(vault::Vault, key::DataKey, owner::AbstractString)::Bool
     _refuse_if_readonly(vault, "clear_running!")
-    running_owner(vault, key) == owner || return false
-    rm(_running_file(vault, key); force=true)
+    path = _running_file(vault, key)
+    lines, ino = _read_running(path)
+    any(l -> l == "owner=$(owner)", lines) || return false
+    # The name may have been relinked to the reclaimer's file since the read. Unlink only while it
+    # still resolves to the inode that carried our token.
+    try
+        _still_inode(path, ino) || return false
+        rm(path; force=true)
+    catch e
+        e isa InterruptException && rethrow()
+        return false
+    end
     return true
 end
 

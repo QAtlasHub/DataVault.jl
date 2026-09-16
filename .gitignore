@@ -1,2 +1,6 @@
 docs/build/
 Manifest.toml
+
+# Coverage counters from `julia --code-coverage`, written next to the source they measure.
+*.cov
+*.info

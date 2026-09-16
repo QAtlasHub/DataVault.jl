@@ -98,8 +98,17 @@ a counter or a plotter run against three runs that had never executed a key crea
 files and freezes their key spaces.
 """
 function open_all(outdir::AbstractString; readonly::Bool=false)::Vector{AttachedStudy}
+    return open_all(find_log_tomls(outdir); readonly=readonly)
+end
+
+# Attach a GIVEN list of log.toml paths. Split out so a caller that also needs to count what was
+# discovered works from one snapshot: `find_log_tomls` is a live `walkdir`, and two calls around
+# the attach loop can disagree because a sibling master started a run in between.
+function open_all(
+    log_paths::AbstractVector{<:AbstractString}; readonly::Bool=false
+)::Vector{AttachedStudy}
     result = AttachedStudy[]
-    for log_path in find_log_tomls(outdir)
+    for log_path in log_paths
         attached = try
             info = read_log_toml(log_path)
             inferred = _infer_outdir(log_path)
@@ -113,6 +122,7 @@ function open_all(outdir::AbstractString; readonly::Bool=false)::Vector{Attached
             )
             AttachedStudy(vault, info, log_path)
         catch e
+            e isa InterruptException && rethrow()
             @warn "Failed to attach log.toml — skipping" path = log_path exception = e
             continue
         end
@@ -177,6 +187,13 @@ function build_master_ledger(outdir::AbstractString)::Vector{Dict{String,String}
         outdir,
         collisions = report.collisions,
     )
+    report.unattached == 0 || @warn(
+        "build_master_ledger could not attach every study it discovered; the merged rows are a " *
+            "SUBSET and nothing in them says so.",
+        outdir,
+        unattached = report.unattached,
+        discovered = report.discovered,
+    )
     return report.rows
 end
 
@@ -189,14 +206,17 @@ const MASTER_META_COLUMNS = ("project_name", "run", "datavault_version", "log_to
 
 [`build_master_ledger`](@ref)'s rows together with whether the sources were compatible:
 
-    (; rows, ok, columns, sources, collisions)
+    (; rows, ok, columns, sources, collisions, unattached, discovered)
 
 - `columns`: the union of every contributing ledger's columns, sorted.
 - `sources`: one `(; project_name, run, log_toml, nrows, columns, missing)` per contributing run,
   where `missing` is the union columns that run's ledger does not have.
 - `collisions`: `(; project_name, run, column)` for each ledger column shadowed by one of the meta
   columns the merge adds.
-- `ok`: every source has the full column set and nothing collided.
+- `unattached`, `discovered`: how many `log.toml` files were found, and how many could not be
+  opened. A study that fails to attach contributes no rows and no `sources` entry, so without this
+  a half-readable outdir reports the same as a complete one.
+- `ok`: every source has the full column set, nothing collided, and nothing failed to attach.
 
 The schema that decides whether a merge is sound here is the CSV COLUMN SET, not `schema.toml`:
 `build_ledger` derives its columns from the run's own params, so two runs whose key spaces differ
@@ -204,6 +224,8 @@ produce rows that are not the same shape. `check_schema_compat` answers a differ
 is whether ONE run satisfies a reader's expectations.
 """
 function master_ledger_report(outdir::AbstractString)
+    log_paths = find_log_tomls(outdir)
+    discovered = length(log_paths)
     rows = Vector{Dict{String,String}}()
     sources = Vector{
         @NamedTuple{
@@ -218,7 +240,8 @@ function master_ledger_report(outdir::AbstractString)
     collisions = Vector{@NamedTuple{project_name::String,run::String,column::String}}()
     raw = Vector{Tuple{String,String,String,Vector{String},Int}}()
 
-    for attached in open_all(outdir; readonly=true)
+    attached_studies = open_all(log_paths; readonly=true)
+    for attached in attached_studies
         local_rows = load_ledger(attached.vault)
         isempty(local_rows) && continue
         log_rel = relpath(attached.log_path, outdir)
@@ -257,8 +280,9 @@ function master_ledger_report(outdir::AbstractString)
         )
     end
 
-    ok = isempty(collisions) && all(s -> isempty(s.missing), sources)
-    return (; rows, ok, columns=union_cols, sources, collisions)
+    unattached = discovered - length(attached_studies)
+    ok = isempty(collisions) && all(s -> isempty(s.missing), sources) && unattached == 0
+    return (; rows, ok, columns=union_cols, sources, collisions, unattached, discovered)
 end
 
 # ── helpers ───────────────────────────────────────────────────────────────────

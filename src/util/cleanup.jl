@@ -25,9 +25,18 @@ function cleanup_stale(vault::Vault; stale_after::Real=600.0)::Int
         for f in files
             endswith(f, ".running") || continue
             fp = joinpath(root, f)
-            _running_age_secs(fp, now_dt) > threshold || continue
-            rm(fp; force=true)
-            count += 1
+            # Per file, so one unreadable lock cannot abandon the rest of the tree. A reaper that
+            # dies at item 1 of 40 looks exactly like one that found nothing to reap.
+            try
+                _running_age_secs(fp, now_dt) > threshold || continue
+                rm(fp; force=true)
+                count += 1
+            catch e
+                e isa InterruptException && rethrow()
+                @warn "could not reap a stale lock; skipping it" path = fp exception = (
+                    e, catch_backtrace()
+                )
+            end
         end
     end
     return count
@@ -56,8 +65,20 @@ function _running_age_secs(path::String, now_dt::DateTime)::Float64
                 break                   # implausibly future-dated → mtime fallback
             end
         end
-    catch
+    catch e
+        e isa InterruptException && rethrow()
     end
-    # Fallback: file mtime (parse failure or corrupt future heartbeat)
-    return time() - mtime(path)
+    # Fallback: file mtime (parse failure or corrupt future heartbeat). `mtime` stats the path, so
+    # it fails on exactly the faults that broke the read above; it cannot be the unguarded half.
+    # Unreadable counts as maximally stale so the fault surfaces at the reclaim rather than
+    # returning `0.0`, which reads as a healthy, perpetually fresh lock.
+    try
+        return time() - mtime(path)
+    catch e
+        e isa InterruptException && rethrow()
+        @warn "could not read a lock's age; treating it as stale" path exception = (
+            e, catch_backtrace()
+        )
+        return Inf
+    end
 end

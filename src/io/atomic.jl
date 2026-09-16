@@ -1,10 +1,17 @@
 # io/atomic.jl — NFS-safe な原子的書き込み
 
+# Replace `dst` with `src` in one step, or not at all. `mv(src, dst; force=true)` is NOT that
+# before Julia 1.12: it unlinks `dst` FIRST and then renames, so a crash in the gap leaves `dst`
+# ABSENT rather than holding either version, and a concurrent reader can observe it missing. This
+# package supports 1.11. Returns whether the rename landed.
+_rename_into_place(src::AbstractString, dst::AbstractString)::Bool =
+    ccall(:rename, Cint, (Cstring, Cstring), src, dst) == 0
+
 """
     _atomic_jld2_write(path, data)
 
 Write `data` (a `Dict`) to `path` atomically by writing to a per-task,
-per-pid temporary file first and then `mv`ing it into place. Safe against
+per-pid temporary file first and then `rename(2)`ing it into place. Safe against
 concurrent writers across processes (NFS) and across tasks within one process.
 """
 function _atomic_jld2_write(path::String, data::Dict)
@@ -18,7 +25,8 @@ function _atomic_jld2_write(path::String, data::Dict)
                 f[string(k)] = v
             end
         end
-        mv(tmp, path; force=true)
+        _rename_into_place(tmp, path) ||
+            error("rename($tmp, $path) failed: ", Base.Libc.strerror(Base.Libc.errno()))
     catch e
         isfile(tmp) && rm(tmp; force=true)
         rethrow(e)

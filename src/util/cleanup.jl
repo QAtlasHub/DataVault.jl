@@ -56,7 +56,8 @@ function _running_age_secs(path::String, now_dt::DateTime)::Float64
                 break                   # implausibly future-dated → mtime fallback
             end
         end
-    catch
+    catch e
+        e isa InterruptException && rethrow()
     end
     # Fallback: file mtime (parse failure or corrupt future heartbeat)
     return time() - mtime(path)

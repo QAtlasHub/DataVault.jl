@@ -35,7 +35,8 @@ function _git_hash(ref_path::String)::String
     dir = isdir(ref_path) ? ref_path : dirname(ref_path)
     try
         strip(read(pipeline(`git -C $dir rev-parse --short HEAD`; stderr=devnull), String))
-    catch
+    catch e
+        e isa InterruptException && rethrow()
         "unknown"
     end
 end

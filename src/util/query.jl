@@ -98,8 +98,17 @@ a counter or a plotter run against three runs that had never executed a key crea
 files and freezes their key spaces.
 """
 function open_all(outdir::AbstractString; readonly::Bool=false)::Vector{AttachedStudy}
+    return open_all(find_log_tomls(outdir); readonly=readonly)
+end
+
+# Attach a GIVEN list of log.toml paths. Split out so a caller that also needs to count what was
+# discovered works from one snapshot: `find_log_tomls` is a live `walkdir`, and two calls around
+# the attach loop can disagree because a sibling master started a run in between.
+function open_all(
+    log_paths::AbstractVector{<:AbstractString}; readonly::Bool=false
+)::Vector{AttachedStudy}
     result = AttachedStudy[]
-    for log_path in find_log_tomls(outdir)
+    for log_path in log_paths
         attached = try
             info = read_log_toml(log_path)
             inferred = _infer_outdir(log_path)
@@ -215,7 +224,8 @@ produce rows that are not the same shape. `check_schema_compat` answers a differ
 is whether ONE run satisfies a reader's expectations.
 """
 function master_ledger_report(outdir::AbstractString)
-    discovered = length(find_log_tomls(outdir))
+    log_paths = find_log_tomls(outdir)
+    discovered = length(log_paths)
     rows = Vector{Dict{String,String}}()
     sources = Vector{
         @NamedTuple{
@@ -230,7 +240,7 @@ function master_ledger_report(outdir::AbstractString)
     collisions = Vector{@NamedTuple{project_name::String,run::String,column::String}}()
     raw = Vector{Tuple{String,String,String,Vector{String},Int}}()
 
-    attached_studies = open_all(outdir; readonly=true)
+    attached_studies = open_all(log_paths; readonly=true)
     for attached in attached_studies
         local_rows = load_ledger(attached.vault)
         isempty(local_rows) && continue

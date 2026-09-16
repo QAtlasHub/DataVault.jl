@@ -290,3 +290,88 @@ end
         rm(outdir; recursive=true, force=true)
     end
 end
+
+# Below: the uncovered half of the `catch` blocks this PR touched. Each is a documented contract
+# reached with a REAL fault, rather than a line executed to move a coverage number.
+
+@testset "when the answer cannot be shown, the owner forms say no" begin
+    outdir = mktempdir()
+    try
+        v = Vault(_RV_CONFIG; outdir=outdir)
+        k = DataVault.keys(v)[1]
+        tok = new_owner_token()
+
+        # No lock at all: nothing proves the key is ours, so all three refuse and none writes.
+        @test !is_running(v, k)
+        @test mark_done!(v, k, tok) == false
+        @test !is_done(v, k)
+        @test refresh_running!(v, k, tok) == false
+        @test clear_running!(v, k, tok) == false
+
+        # `_still_inode` that cannot `stat` is "no", and does not throw out of a `Bool` verb.
+        @test acquire_running!(v, k, tok) === :ok
+        path = DataVault._running_file(v, k)
+        ino = stat(path).inode
+        chmod(dirname(path), 0o000)
+        blinded = DataVault._still_inode(path, ino)
+        chmod(dirname(path), 0o755)
+        @test blinded == false
+        @test DataVault._still_inode(path, ino)      # control: readable again, and it says yes
+
+        # An unlink that cannot happen is `false` with the lock left intact, not a half-release.
+        chmod(dirname(path), 0o555)
+        cleared = clear_running!(v, k, tok)
+        chmod(dirname(path), 0o755)
+        @test cleared == false
+        @test is_running(v, k)
+        @test running_owner(v, k) == tok
+        @test clear_running!(v, k, tok) == true      # control: it can once the fault clears
+    finally
+        rm(outdir; recursive=true, force=true)
+    end
+end
+
+@testset "a corrupt heartbeat falls back to mtime instead of throwing" begin
+    # `cleanup_stale` reads this to tell a live job from a crashed one. A half-written heartbeat
+    # line must not take the sweep down, and must not read as infinitely fresh either.
+    outdir = mktempdir()
+    try
+        v = Vault(_RV_CONFIG; outdir=outdir)
+        k = DataVault.keys(v)[1]
+        @test acquire_running!(v, k, new_owner_token()) === :ok
+        path = DataVault._running_file(v, k)
+        @test running_heartbeat(v, k) isa DateTime   # control: it parses when well-formed
+
+        write(path, "pid=1\nheartbeat=NOT-A-DATE\n")
+        @test running_heartbeat(v, k) === nothing
+        age = DataVault._running_age_secs(path, Dates.now())
+        @test isfinite(age) && age >= 0.0            # mtime fallback, not an exception
+    finally
+        rm(outdir; recursive=true, force=true)
+    end
+end
+
+@testset "_git_hash outside a repository is \"unknown\", not a failure" begin
+    # `.done` records the commit that produced the payload, so a vault living outside any checkout
+    # still has to be able to close a key.
+    plain, repo = mktempdir(), mktempdir()
+    try
+        @test DataVault._git_hash(plain) == "unknown"
+
+        # Control: a real repo, built here so the assertion does not depend on how CI checked the
+        # package out.
+        run(pipeline(`git -C $repo init -q`; stderr=devnull))
+        write(joinpath(repo, "f"), "x")
+        run(pipeline(`git -C $repo add f`; stderr=devnull))
+        run(
+            pipeline(
+                `git -C $repo -c user.email=t@example.invalid -c user.name=t commit -q -m x`;
+                stderr=devnull,
+            ),
+        )
+        @test occursin(r"^[0-9a-f]{7,}$", DataVault._git_hash(repo))
+    finally
+        rm(plain; recursive=true, force=true)
+        rm(repo; recursive=true, force=true)
+    end
+end

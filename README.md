@@ -246,6 +246,40 @@ DataVault.clear_running!(vault, key, tok)               # 自分のものだけ�
 2引数の形は従来どおり残してある。owner 検査は read-then-write なので、その隙間での reclaim までは
 閉じない。閉じるのは「reclaim が **すでに起きている**」場合、つまりキーの残り時間ずっと続く方。
 
+### 中間成果物 (artifact) — セル間で共有し、一度だけ作る
+
+セルの高価な前処理が軸の**一部**にしか依存しないとき（駆動周波数に依らない基底状態など）、
+config で依存する軸を宣言し（ParamIO の `[artifacts.<name>]`）、`work_fn` の中で `artifact!` を呼ぶ:
+
+```toml
+[artifacts.ground_state]
+depends_on = ["U", "D", "cutoff"]   # 読むパラメタを全部書く
+version    = 1                      # 作るコードを変えたら上げる
+```
+
+```julia
+work_fn = key -> begin
+    gs = DataVault.artifact!(vault, :ground_state, key) do akey   # 無いときだけ走る
+        prepare_ground_state(param(akey, "run.U"), param(akey, "run.D"))
+    end
+    Dict("chi" => respond(gs, param(key, "run.omega1")))
+end
+```
+
+- **識別**は `depends_on` に射影したキー + `version`。どれかが変われば別物になり、古いものは使われない。
+- **保存先**は run の外: `{outdir}/artifacts/{project}/{name}/{sha256 先頭16桁}/` に
+  `artifact.jld2`（中身 + 完全な識別文字列）と `inputs.toml`（人が読む入力の記録）。
+  同じ `outdir` の別ジョブ・別 run からも再利用される。
+- **`akey` は射影後のキー**なので、宣言していないパラメタを builder が読むとそこで失敗する
+  （宣言漏れで別の値のセル同士が同じ artifact を共有してしまうのを防ぐ）。
+- **並行**: 同時に要求した worker は `.running` と同じ `link()` ロックで直列化され、1 人だけが作る。
+  `wait=true`（既定）なら他は完成を待って読む、`wait=false` なら `ArtifactBusy` を投げる。
+  builder が例外を投げたら何も残さずロックを外す。
+- **ハートビート**は別タスクで回すので、長いビルドには空いたスレッドが要る（`julia -t N,1` など）。
+  1 スレッドだと `stale_after` 経過後に待機側が同じものを作り直しうる（結果は壊れない、計算が無駄になる）。
+- `readonly=true` の Vault は読むだけで、無ければ例外。
+- `has_artifact` / `load_artifact` / `tryload_artifact` / `DataVault.artifact_dir`。
+
 ## カスタマイズ
 
 ### Path scheme のカスタマイズ

@@ -94,6 +94,12 @@ end
         @test t["version"] == 1
         @test Set(Base.keys(t["params"])) == Set(["run.U", "run.D"])
     end
+    # A value TOML cannot hold is written as its repr, element-wise inside a vector, so
+    # inputs.toml never fails to serialise the parameters it describes.
+    @test DataVault._toml_safe([1, :a]) == [1, ":a"]
+    @test DataVault._toml_safe(1 + 2im) == "1 + 2im"
+    @test TOML.parse(sprint(TOML.print, Dict("p" => DataVault._toml_safe([0.5, :x]))))["p"] ==
+        [0.5, ":x"]
 end
 
 @testset "artifact!: a readonly vault loads but never builds" begin
@@ -123,7 +129,14 @@ end
         lock = joinpath(DataVault.artifact_dir(v, :gs, k), ".building")
         tok = new_owner_token()
         @test DataVault._acquire_lock_at!(lock, tok) === :ok
-        @test_throws ArtifactBusy artifact!(_gs, v, :gs, k; wait=false)
+        err = try
+            artifact!(_gs, v, :gs, k; wait=false)
+        catch e
+            e
+        end
+        @test err isa ArtifactBusy
+        @test err.identity == ParamIO.artifact_identity(v.spec, :gs, k)
+        @test occursin("\"gs\" is being built elsewhere", sprint(showerror, err))
         @test_throws ErrorException artifact!(_gs, v, :gs, k; poll=0.05, timeout=0.2)
         # The control for the reclaim: the same held lock, now older than `stale_after`.
         @test artifact!(_gs, v, :gs, k; stale_after=0.0, heartbeat_interval=-1.0) == _gs(k)

@@ -106,8 +106,9 @@ end
             mod = Base.require(Main, Symbol(t.name))
             origin = Base.pkgorigins[Base.PkgId(mod)]
             checkable = DataVault._cached_sources(origin.cachepath) !== nothing
-            @test config_root(record(t, observe_sources(t.vault)))["loaded"] ==
-                (checkable ? "matches" : "unknown")
+            r0 = record(t, observe_sources(t.vault))
+            @test config_root(r0)["loaded"] == (checkable ? "matches" : "unknown")
+            @test r0["binding"] == "unverified"         # a match is recorded, never claimed
             # The loaded code stays as it was; the file on disk changes under it.
             write(
                 joinpath(t.pkg, "src", "$(t.name).jl"),
@@ -124,7 +125,9 @@ end
 
 @testset "binding_of: what an observation may claim" begin
     ok = Dict("config" => "matches", "pkg:A:1" => "matches")
-    @test DataVault.binding_of(ok, false, String[]) == ("loaded-matches-disk", String[])
+    # Everything checkable matched, and still no match is claimed.
+    @test DataVault.binding_of(ok, false, String[]) ==
+        ("unverified", [DataVault.NO_MATCH_CLAIMED])
     @test DataVault.binding_of(Dict("config" => "differs"), false, String[])[1] ==
         "loaded-differs-from-disk"
     for (status, revise, main) in (

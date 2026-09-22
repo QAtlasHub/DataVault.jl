@@ -4,8 +4,11 @@
 #
 #   * a SOURCE SNAPSHOT: every file of each source root as (path, type, mode, size, SHA-256),
 #     identified by the SHA-256 of that inventory, `src1-<hex>`, and stored once per vault;
-#   * its BINDING to the code the process runs: `unverified`, unless every package the process
-#     loaded from a root was checked against the snapshot through its precompile cache header.
+#   * its BINDING to the code the process runs, which never claims a match: `unverified`, or
+#     `loaded-differs-from-disk` when a loaded package's cached sources are known to differ from
+#     the snapshot. A match is not claimed because it cannot be shown from inside the process:
+#     code defined in a script, a closure, or a method added to Base from `Main` runs without
+#     leaving a trace in any cache header (`Base._included_files` records no run-time include).
 #
 # Nothing here says the snapshot is the code that ran. It says what was on disk, when, and how far
 # the process's loaded code was checked against it. File names under `.datavault/` must never end
@@ -299,12 +302,13 @@ end
 """
     binding_of(status, revise_loaded, main_files_in_roots) -> (binding, reasons)
 
-The binding an observation can claim, from each root's loaded status. `loaded-matches-disk` only
-when the config's repository (where the study's code lives) was loaded from and matched, every
-other root that was loaded from matched, Revise is not loaded, and no file included into `Main`
-lies inside a root (code defined there cannot be checked).
-`loaded-differs-from-disk` when a loaded package's sources differ from the snapshot. Otherwise
-`unverified`, with the reasons.
+The binding an observation can claim, from each root's loaded status: `loaded-differs-from-disk`
+when a loaded package's sources differ from the snapshot (a fact: the bytes it was built from are
+not on disk), and otherwise `unverified`, with the reasons. It never returns
+`loaded-matches-disk`: that every loaded package matched does not show that the code which ran
+was theirs, since code defined outside any package (a script, a closure, a method added to Base
+from `Main`) leaves no trace to check. A reader treats a `loaded-matches-disk` written by an
+earlier version as `unverified`.
 """
 function binding_of(status::AbstractDict, revise_loaded::Bool, main_files_in_roots)
     differs = sort([k for (k, v) in status if v == "differs"])
@@ -327,8 +331,13 @@ function binding_of(status::AbstractDict, revise_loaded::Bool, main_files_in_roo
         "$f is included into Main, where its code cannot be checked" for
         f in main_files_in_roots
     )
-    return isempty(reasons) ? "loaded-matches-disk" : "unverified", reasons
+    isempty(reasons) && push!(reasons, NO_MATCH_CLAIMED)
+    return "unverified", reasons
 end
+
+const NO_MATCH_CLAIMED =
+    "every loaded package matched the snapshot, but a match is not claimed: code defined " *
+    "outside a package (a script, a closure, a method added from Main) cannot be checked"
 
 # ── the observation ───────────────────────────────────────────────────────────────────────────
 

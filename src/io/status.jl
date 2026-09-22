@@ -169,7 +169,14 @@ function acquire_running!(
     vault::Vault, key::DataKey, owner::AbstractString; stale_after::Real=600.0
 )::Symbol
     _refuse_if_readonly(vault, "acquire_running!")
-    path = _running_file(vault, key)
+    return _acquire_lock_at!(_running_file(vault, key), owner; stale_after=stale_after)
+end
+
+# The lock itself, on a path rather than a key, so that anything with a directory — a sweep
+# key's status dir, an artifact's dir — takes the same `link()` lock and the same reclaim rule.
+function _acquire_lock_at!(
+    path::AbstractString, owner::AbstractString; stale_after::Real=600.0
+)::Symbol
     mkpath(dirname(path))
 
     reclaimed = false
@@ -278,17 +285,30 @@ and unreadable are both "not provably ours".
 """
 function refresh_running!(vault::Vault, key::DataKey, owner::AbstractString)::Bool
     _refuse_if_readonly(vault, "refresh_running!")
-    lines = _running_lines(vault, key)
+    return _refresh_lock_at!(_running_file(vault, key), owner)
+end
+
+function _refresh_lock_at!(path::AbstractString, owner::AbstractString)::Bool
+    lines = _lock_lines(path)
     lines === nothing && return false
     any(l -> l == "owner=$(owner)", lines) || return false
 
     now_str = Dates.format(Dates.now(), "yyyy-mm-ddTHH:MM:SS")
-    open(_running_file(vault, key), "w") do io
+    open(path, "w") do io
         for line in lines
             println(io, startswith(line, "heartbeat=") ? "heartbeat=$(now_str)" : line)
         end
     end
     return true
+end
+
+# A lock file's lines, or `nothing` when it cannot be read — absent and unreadable alike.
+function _lock_lines(path::AbstractString)::Union{Vector{String},Nothing}
+    try
+        return readlines(path)
+    catch
+        return nothing
+    end
 end
 
 """
@@ -352,8 +372,14 @@ from the owner-blind form is unbounded-to-microseconds, not to zero.
 """
 function clear_running!(vault::Vault, key::DataKey, owner::AbstractString)::Bool
     _refuse_if_readonly(vault, "clear_running!")
-    running_owner(vault, key) == owner || return false
-    rm(_running_file(vault, key); force=true)
+    return _clear_lock_at!(_running_file(vault, key), owner)
+end
+
+function _clear_lock_at!(path::AbstractString, owner::AbstractString)::Bool
+    lines = _lock_lines(path)
+    lines === nothing && return false
+    any(l -> l == "owner=$(owner)", lines) || return false
+    rm(path; force=true)
     return true
 end
 

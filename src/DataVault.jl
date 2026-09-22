@@ -33,7 +33,7 @@ import Base: keys
 
 export Vault
 export DataKey                          # re-export from ParamIO
-# `param_path` / `data_dir` / `data_file` / `status_dir` / `bin_dir` are public API — documented,
+# `param_path` / `data_dir` / `data_file` / `status_dir` / `bin_dir` / `artifact_dir` are public API — documented,
 # and what a consumer should call instead of rebuilding a path — but deliberately NOT exported.
 # `data_dir` and `status_dir` are names a study naturally gives its own accessors: FiniteTemperature
 # defines both on its own vault type and exports them, so exporting them here makes
@@ -44,6 +44,7 @@ export is_done, mark_done!, mark_running!, touch_running!, running_heartbeat
 export clear_running!, is_running
 export acquire_running!, refresh_running!, running_age_secs
 export new_owner_token, running_owner
+export artifact!, has_artifact, load_artifact, tryload_artifact, ArtifactBusy
 export build_ledger, record_figure, cleanup_stale
 export archive_figure!, list_figure_history, restore_figure!
 export build_experiment_report, build_experiments_index, gather_code_versions
@@ -66,6 +67,7 @@ include("core/paths.jl")        # _run_*_dir 等を log_toml.jl から使う
 include("io/atomic.jl")
 include("io/data.jl")
 include("io/status.jl")
+include("io/artifact.jl")      # [artifacts.<name>]: built once, reused across cells and runs
 
 include("util/log_toml.jl")    # vault.jl の constructor から呼ばれる
 include("util/snapshot.jl")    # vault.jl の constructor から呼ばれる

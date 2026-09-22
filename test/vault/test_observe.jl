@@ -11,7 +11,7 @@ git!(repo, args...) = run(`git -C $repo -c user.name=t -c user.email=t@t $args`)
 function with_observed_repo(f)
     repo = mktempdir()
     out = mktempdir()
-    name = "ObsProbe" * string(rand(UInt32); base=16)
+    name = "ObsProbe" * string(time_ns(); base=16)   # not rand: every testset reseeds it
     try
         cp(_OBS_CFG, joinpath(repo, "study.toml"))
         write(joinpath(repo, ".gitignore"), "ignored.txt\n")
@@ -122,18 +122,83 @@ end
     end
 end
 
+# The package of `with_observed_repo`, loaded, with `f(t, mod)`; `checkable` when its cache header can
+# be read in this Julia (otherwise every claim must stay unverified).
+function with_loaded_probe(f)
+    with_observed_repo() do t
+        pushfirst!(LOAD_PATH, t.pkg)
+        try
+            mod = Base.require(Main, Symbol(t.name))
+            origin = Base.pkgorigins[Base.PkgId(mod)]
+            f(t, mod, DataVault._cached_sources(origin.cachepath) !== nothing)
+        finally
+            filter!(!=(t.pkg), LOAD_PATH)
+        end
+    end
+end
+
+script_defined(k) = 1
+
+@testset "observe_sources: unverified unless the entry code is named and checked" begin
+    with_loaded_probe() do t, mod, checkable
+        r = record(t, observe_sources(t.vault))
+        @test r["binding"] == "unverified"
+        @test any(contains("no entry code was named"), r["binding_reasons"])
+
+        answer = getfield(mod, :answer)
+        r = record(t, observe_sources(t.vault; code=[answer]))
+        @test r["binding"] == (checkable ? "loaded-matches-disk" : "unverified")
+        @test only(r["code"])["module"] == t.name && !only(r["code"])["captures"]
+        @test config_root(r)["loaded_matches_head"] == (checkable ? "true" : "unknown")
+
+        for (entry, why) in (
+            (script_defined, r"defined in Main|no readable precompile cache"),
+            (
+                let a = 2
+                    k -> a + k
+                end,
+                r"captures values",
+            ),
+            (sum, r"no readable precompile cache|not loaded from a source root"),
+        )
+            r = record(t, observe_sources(t.vault; code=[entry]))
+            @test r["binding"] == "unverified"
+            @test any(contains(why), r["binding_reasons"])
+        end
+
+        # A method added to the package from outside its files: the entry is unchanged on disk,
+        # but what it calls is not what the files say.
+        Core.eval(mod, :(helper() = 0))
+        r = record(t, observe_sources(t.vault; code=[answer]))
+        @test r["binding"] == "unverified"
+        @test any(contains("outside $(t.name)'s checked sources"), r["binding_reasons"])
+    end
+end
+
+@testset "observe_sources: loaded code that HEAD does not hold is told apart" begin
+    with_loaded_probe() do t, mod, checkable
+        checkable || return nothing
+        # The loaded file stays byte-identical on disk, but is no longer what HEAD holds.
+        git!(t.repo, "rm", "-q", "--cached", joinpath(t.pkg, "src", "$(t.name).jl"))
+        git!(t.repo, "commit", "-qm", "untrack")
+        r = record(t, observe_sources(t.vault; code=[getfield(mod, :answer)]))
+        @test config_root(r)["loaded"] == "matches"
+        @test config_root(r)["loaded_matches_head"] == "false"
+    end
+end
+
 @testset "binding_of: what an observation may claim" begin
     ok = Dict("config" => "matches", "pkg:A:1" => "matches")
     @test DataVault.binding_of(ok, false, String[]) == ("loaded-matches-disk", String[])
     @test DataVault.binding_of(Dict("config" => "differs"), false, String[])[1] ==
         "loaded-differs-from-disk"
-    for (status, revise, main) in (
+    for (status, revise, code) in (
         (Dict("config" => "unknown"), false, String[]),
         (Dict("config" => "not-loaded", "pkg:A:1" => "matches"), false, String[]),
         (ok, true, String[]),
-        (ok, false, ["/repo/scripts/compute.jl"]),
+        (ok, false, ["work is defined in Main"]),
     )
-        binding, reasons = DataVault.binding_of(status, revise, main)
+        binding, reasons = DataVault.binding_of(status, revise, code)
         @test binding == "unverified" && !isempty(reasons)
     end
 end

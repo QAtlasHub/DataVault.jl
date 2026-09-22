@@ -4,15 +4,22 @@
 #
 #   * a SOURCE SNAPSHOT: every file of each source root as (path, type, mode, size, SHA-256),
 #     identified by the SHA-256 of that inventory, `src1-<hex>`, and stored once per vault;
-#   * its BINDING to the code the process runs: `unverified`, unless every package the process
-#     loaded from a root was checked against the snapshot through its precompile cache header.
+#   * its BINDING to the code the process runs: `unverified` unless shown otherwise. It is
+#     `loaded-matches-disk` only when the caller NAMES the entry code the process will run (a
+#     sweep's work function, a report's recipe), that code and every method of the package that
+#     owns it come from sources listed in a precompile cache header, and those sources equal the
+#     snapshot. Code defined in `Main` — a script, the REPL, `-e`, a closure — cannot be checked,
+#     and says so.
 #
 # Nothing here says the snapshot is the code that ran. It says what was on disk, when, and how far
 # the process's loaded code was checked against it. File names under `.datavault/` must never end
 # in `.log.toml`: discovery walks the whole tree for that suffix.
 
 const SOURCE_RECIPE = "src1"
-const OBSERVATION_VERSION = 1
+# 2: the binding checks the named entry code. Version 1 looked for files included into `Main` in
+# `Base._included_files`, which records no include made at run time, so a v1 `loaded-matches-disk`
+# can hide code defined in a script.
+const OBSERVATION_VERSION = 2
 const MATERIALIZE_EXTENSIONS = (".jl", ".toml")    # contents kept; every other file inventoried only
 const DEFAULT_HASH_LIMIT = 64 * 1024^2               # larger files are inventoried without a digest
 const ENV_RECORDED = (
@@ -264,14 +271,15 @@ end
 
 # Per root: `matches` when every source of every package loaded from it equals the snapshot's
 # bytes, `differs` when one does not, `unknown` when a loaded package cannot be checked, and
-# `not-loaded` when none came from it.
-function _loaded_status(roots, entries)::Dict{String,String}
+# `not-loaded` when none came from it. `files` holds, per root, the loaded sources it checked.
+function _loaded_status(roots, entries)
     byfile = Dict(
         _real(e.full) => e for e in entries if e.type == "file" && e.sha256 != "skipped"
     )
     status = Dict(r.name => "not-loaded" for r in roots)
     rank = Dict("not-loaded" => 0, "matches" => 1, "unknown" => 2, "differs" => 3)
     raise!(name, s) = rank[s] > rank[status[name]] && (status[name] = s)
+    files = Dict(r.name => String[] for r in roots)
     for (_, origin) in Base.pkgorigins
         origin.path === nothing && continue
         i = findfirst(r -> _inside(origin.path, r.dir), roots)
@@ -291,22 +299,175 @@ function _loaded_status(roots, entries)::Dict{String,String}
             else
                 raise!(name, "matches")
             end
+            push!(files[name], _real(inc.filename))
         end
     end
-    return status
+    return status, files
+end
+
+# Whether the loaded sources of a git root are also what HEAD holds: tracked, and unchanged from
+# HEAD. Only then does the root's `head` name the code that was loaded, not just the tree.
+function _loaded_matches_head(root, loaded, files)::String
+    loaded == "not-loaded" && return "not-loaded"
+    (root.kind === :git && loaded == "matches" && !isempty(files)) || return "unknown"
+    rel = [relpath(f, _real(root.dir)) for f in unique(files)]
+    tracked = _git_read(root.dir, "ls-files", "--error-unmatch", "--", rel...)
+    tracked === nothing && return "false"
+    changed = _git_read(root.dir, "diff", "--name-only", "HEAD", "--", rel...)
+    changed === nothing && return "unknown"
+    return string(isempty(changed))
+end
+
+# ── entry code ────────────────────────────────────────────────────────────────────────────────
+
+# Julia 1.12 partitions bindings and methods by world age: a caller already running does not see a
+# method or a name defined after it started (a patch made by the script that called us). Every
+# lookup here therefore asks the latest world.
+_latest_names(mod) = Base.invokelatest(names, mod; all=true)
+_latest_methods(f) = Base.invokelatest(methods, f)
+function _latest_get(mod, n)
+    return if Base.invokelatest(isdefined, mod, n)
+        Base.invokelatest(getfield, mod, n)
+    else
+        nothing
+    end
+end
+
+# The sources of the package `mod` belongs to, as its cache header lists them, or `nothing`.
+function _package_sources(mod::Module)
+    top = Base.moduleroot(mod)
+    origin = get(Base.pkgorigins, Base.PkgId(top), nothing)
+    origin === nothing && return nothing
+    incs = _cached_sources(origin.cachepath)
+    (incs === nothing || isempty(incs)) && return nothing
+    return (; path=origin.path, files=Set(_real(x.filename) for x in incs))
+end
+
+_where(m::Method) = "$(m.file):$(m.line)"
+
+# A method's code is checked when it was defined by its package's own sources: its module belongs
+# to that package, and its file is one the cache header lists. A method evaluated into the package
+# from `Main` (a patch, an `@eval`) fails one or the other.
+function _method_checked(m::Method, top::Module, files)
+    return Base.moduleroot(m.module) === top && _real(String(m.file)) in files
 end
 
 """
-    binding_of(status, revise_loaded, main_files_in_roots) -> (binding, reasons)
+    entry_code_reasons(code, roots, status) -> Vector{String}
 
-The binding an observation can claim, from each root's loaded status. `loaded-matches-disk` only
-when the config's repository (where the study's code lives) was loaded from and matched, every
-other root that was loaded from matched, Revise is not loaded, and no file included into `Main`
-lies inside a root (code defined there cannot be checked).
-`loaded-differs-from-disk` when a loaded package's sources differ from the snapshot. Otherwise
-`unverified`, with the reasons.
+Why the entry code cannot be vouched for; empty when it can. Each entry must be a function that
+captures nothing, owned by a package loaded from a source root whose loaded status is `matches`,
+and every method of every function that package defines must come from the package's own cached
+sources. Without entry code nothing is known about what the process will run.
 """
-function binding_of(status::AbstractDict, revise_loaded::Bool, main_files_in_roots)
+function entry_code_reasons(code, roots, status)::Vector{String}
+    isempty(code) &&
+        return ["no entry code was named, so what this process will run is not known"]
+    reasons = String[]
+    seen = Set{Module}()
+    for f in code
+        T = typeof(f)
+        name = string(f)
+        if !(f isa Function)
+            push!(reasons, "$name is not a function")
+            continue
+        end
+        fieldcount(T) == 0 || push!(
+            reasons,
+            "$name captures values (a closure or a callable struct), which cannot be checked",
+        )
+        if nameof(parentmodule(f)) === :__deserialized_types__
+            push!(
+                reasons,
+                "$name arrived from another process (a closure sent by the master), so its " *
+                "code is that process's and cannot be checked here",
+            )
+            continue
+        end
+        top = Base.moduleroot(parentmodule(f))
+        if top === Main
+            push!(
+                reasons,
+                "$name is defined in Main (a script, the REPL or -e), which cannot be checked",
+            )
+            continue
+        end
+        src = _package_sources(top)
+        if src === nothing
+            push!(reasons, "$name belongs to $top, which has no readable precompile cache")
+            continue
+        end
+        i = findfirst(r -> _inside(src.path, r.dir), roots)
+        if i === nothing
+            push!(reasons, "$name belongs to $top, which is not loaded from a source root")
+            continue
+        end
+        get(status, roots[i].name, "unknown") == "matches" || push!(
+            reasons,
+            "$name belongs to $top, whose loaded sources do not match the snapshot",
+        )
+        for m in _latest_methods(f)
+            _method_checked(m, top, src.files) || push!(
+                reasons,
+                "a method of $name is defined at $(_where(m)), outside $top's checked sources",
+            )
+        end
+        top in seen && continue
+        push!(seen, top)
+        append!(reasons, _patched_methods(top, src.files))
+    end
+    return unique!(reasons)
+end
+
+# Methods of the package's own functions that its sources did not define: what the entry code
+# calls can be changed from outside without changing a file.
+function _patched_methods(top::Module, files)::Vector{String}
+    out = String[]
+    for mod in _submodules(top), n in _latest_names(mod)
+        f = _latest_get(mod, n)
+        f isa Function && parentmodule(f) === mod || continue
+        for m in _latest_methods(f)
+            # A method another package adds to this function is that package's code, not a patch.
+            owner = Base.moduleroot(m.module)
+            (owner === top || owner === Main) || continue
+            _method_checked(m, top, files) || push!(
+                out,
+                "$(mod).$(n) has a method defined at $(_where(m)), outside $top's checked sources",
+            )
+        end
+    end
+    return out
+end
+
+function _submodules(top::Module)
+    out = Module[top]
+    i = 1
+    while i <= length(out)
+        mod = out[i]
+        for n in _latest_names(mod)
+            x = _latest_get(mod, n)
+            x isa Module &&
+                x !== mod &&
+                parentmodule(x) === mod &&
+                !(x in out) &&
+                push!(out, x)
+        end
+        i += 1
+    end
+    return out
+end
+
+"""
+    binding_of(status, revise_loaded, code_reasons) -> (binding, reasons)
+
+The binding an observation can claim, from each root's loaded status and what
+[`entry_code_reasons`](@ref) found. `loaded-matches-disk` only when the config's repository (where
+the study's code lives) was loaded from and matched, every other root that was loaded from
+matched, Revise is not loaded, and the named entry code was vouched for (`code_reasons` empty).
+`loaded-differs-from-disk` when a loaded package's sources differ from the snapshot. Otherwise
+`unverified`, with the reasons — the default: a claim needs evidence, its absence does not.
+"""
+function binding_of(status::AbstractDict, revise_loaded::Bool, code_reasons)
     differs = sort([k for (k, v) in status if v == "differs"])
     isempty(differs) || return "loaded-differs-from-disk",
     ["$k: a loaded package's sources differ from the snapshot" for k in differs]
@@ -322,22 +483,31 @@ function binding_of(status::AbstractDict, revise_loaded::Bool, main_files_in_roo
         "among what was checked",
     )
     revise_loaded && push!(reasons, "Revise is loaded: code can change after it is checked")
-    append!(
-        reasons,
-        "$f is included into Main, where its code cannot be checked" for
-        f in main_files_in_roots
-    )
+    append!(reasons, code_reasons)
     return isempty(reasons) ? "loaded-matches-disk" : "unverified", reasons
+end
+
+# What an entry was, for the record: its name, the module that owns it, and where its methods are.
+function _describe(f)::Dict{String,Any}
+    f isa Function ||
+        return Dict{String,Any}("name" => string(f), "kind" => "not a function")
+    return Dict{String,Any}(
+        "name" => string(f),
+        "module" => string(parentmodule(f)),
+        "captures" => fieldcount(typeof(f)) > 0,
+        "methods" => [_where(m) for m in _latest_methods(f)],
+    )
 end
 
 # ── the observation ───────────────────────────────────────────────────────────────────────────
 
-function _root_record(root, loaded::String)::Dict{String,Any}
+function _root_record(root, loaded::String, files)::Dict{String,Any}
     record = Dict{String,Any}(
         "name" => root.name,
         "kind" => String(root.kind),
         "dir" => root.dir,
         "loaded" => loaded,
+        "loaded_matches_head" => _loaded_matches_head(root, loaded, files),
     )
     if root.kind === :git
         observed = _git_observe(root.dir)
@@ -379,7 +549,8 @@ function _julia_record()::Dict{String,Any}
 end
 
 """
-    observe_sources(vault; phase = "run-start", process = Dict(), hash_limit = 64 MiB) -> token
+    observe_sources(vault; phase = "run-start", process = Dict(), hash_limit = 64 MiB,
+                    code = ()) -> token
 
 Observe the source roots this process can see — the config's repository and every `path`
 dependency of the active environment — store the snapshot (once per distinct content) and an
@@ -390,12 +561,20 @@ as a worker id), which snapshot (`source`), each root's git HEAD and whether it 
 build and a fixed list of environment variables, and the **binding**: how far the code this process
 has loaded was checked against the snapshot (see [`binding_of`](@ref)). File contents are stored
 only for `.jl` and `.toml` files; every other file is inventoried by size and digest.
+
+`code` names the entry functions this process will run for its results — a sweep's work
+function, a report's recipe. Without it the binding is `unverified`: what the process will run is
+not known. With it, the binding can be `loaded-matches-disk` only if each entry passes
+[`entry_code_reasons`](@ref). Each git root also records `loaded_matches_head`: `"true"` when the
+sources loaded from it are tracked and unchanged from its `head`, so that commit names the loaded
+code rather than only the tree.
 """
 function observe_sources(
     vault::Vault;
     phase::AbstractString="run-start",
     process::AbstractDict=Dict{String,Any}(),
     hash_limit::Integer=DEFAULT_HASH_LIMIT,
+    code=(),
 )::String
     _refuse_if_readonly(vault, "observe_sources")
     observed_at = _utc_stamp()
@@ -413,11 +592,9 @@ function observe_sources(
     )
     source = _publish_snapshot(vault, _files_tsv(entries), state, blobs)
 
-    status = _loaded_status(roots, entries)
+    status, loaded_files = _loaded_status(roots, entries)
     revise = any(id -> id.name == "Revise", keys(Base.loaded_modules))
-    main_files = [f for (m, f) in Base._included_files if m === Main]
-    in_roots = [f for f in main_files if any(r -> _inside(f, r.dir), roots)]
-    binding, reasons = binding_of(status, revise, in_roots)
+    binding, reasons = binding_of(status, revise, entry_code_reasons(code, roots, status))
 
     token =
         "obs$(OBSERVATION_VERSION)-" *
@@ -434,7 +611,8 @@ function observe_sources(
         "source" => source,
         "binding" => binding,
         "binding_reasons" => reasons,
-        "roots" => [_root_record(r, status[r.name]) for r in roots],
+        "roots" => [_root_record(r, status[r.name], loaded_files[r.name]) for r in roots],
+        "code" => [_describe(f) for f in code],
         "process" => merge(
             Dict{String,Any}("host" => gethostname(), "pid" => getpid()),
             Dict{String,Any}(String(k) => v for (k, v) in process),
@@ -443,7 +621,8 @@ function observe_sources(
         "env" => Dict{String,Any}(k => ENV[k] for k in ENV_RECORDED if haskey(ENV, k)),
         "environment" => _environment_record(vault),
         "revise_loaded" => revise,
-        "main_files" => main_files,
+        "program_file" => isempty(PROGRAM_FILE) ? "" : abspath(PROGRAM_FILE),
+        "interactive" => isinteractive(),
     )
     path = joinpath(_observations_dir(vault), "$token.toml")
     _atomic_bytes_write(path, sprint(io -> TOML.print(io, record; sorted=true)))

@@ -34,18 +34,20 @@ function tryload(
 end
 
 """
-    DataVault.save!(vault, key, data; prefix="data")
+    DataVault.save!(vault, key, data; prefix="data") -> (; file, sha256)
 
 Atomically write `data` (a Dict) to the JLD2 data file for `key`.
 Uses a tmp file + rename pattern safe on NFS.
-Does NOT automatically mark done — call `mark_done!` explicitly.
+Does NOT automatically mark done — call `mark_done!` explicitly, and pass it what this returns
+(`mark_done!(vault, key; result=save!(…))`) so the `.done` marker names the bytes that were
+written: `sha256` is taken from the temporary file before the rename, not from `file` afterwards.
 """
 function save!(vault::Vault, key::DataKey, data::Dict; prefix::AbstractString="data")
     _refuse_if_readonly(vault, "save!")
     path = _data_file(vault, key; prefix=prefix)
     mkpath(dirname(path))
-    _atomic_jld2_write(path, data)
-    return nothing
+    sha = _atomic_jld2_write(path, data)
+    return (; file=path, sha256=sha)
 end
 
 """

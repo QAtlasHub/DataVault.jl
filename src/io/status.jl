@@ -23,14 +23,29 @@ using Printf: @sprintf
 is_done(vault::Vault, key::DataKey)::Bool = isfile(_done_file(vault, key))
 
 """
-    mark_done!(vault, key; jobid=nothing, tag_value=nothing)
+    mark_done!(vault, key; jobid=nothing, tag_value=nothing, result=nothing)
 
 Write a `.done` file for `key`. Removes the corresponding `.running` file if present.
 
-Fields written: `jobid`, `completed`, `git_hash`, and optionally `tag_value`.
-`jobid` defaults to `SLURM_JOB_ID` env var, then current PID.
+`result` is what [`save!`](@ref) returned for this key. Pass it: it is the only way the marker can
+name the bytes that were written.
+
+Fields written (`done_version=2`), every one of them on every call:
+
+| field | value |
+|---|---|
+| `jobid` | `SLURM_JOB_ID`, else the current PID, unless given |
+| `completed` | local time with no zone, as before (kept for existing readers) |
+| `completed_at` | the completion time in UTC, `yyyy-mm-ddTHH:MM:SSZ` |
+| `git_hash` | short HEAD of the config's repo, as before (kept for existing readers) |
+| `git_commit_observed`, `git_object_format` | full HEAD and object format, or `unknown` |
+| `git_observed_at` | `completion`: the working tree seen now, not the code the process loaded |
+| `result_sha256`, `result_file` | from `result` (file relative to the outdir), or `unknown` |
+| `tag_value` | only when given |
 """
-function mark_done!(vault::Vault, key::DataKey; jobid=nothing, tag_value=nothing)
+function mark_done!(
+    vault::Vault, key::DataKey; jobid=nothing, tag_value=nothing, result=nothing
+)
     _refuse_if_readonly(vault, "mark_done!")
     done = _done_file(vault, key)
     mkpath(dirname(done))
@@ -44,9 +59,27 @@ function mark_done!(vault::Vault, key::DataKey; jobid=nothing, tag_value=nothing
     end
 
     completed = Dates.format(Dates.now(), "yyyy-mm-ddTHH:MM:SS")
+    completed_at = Dates.format(Dates.now(Dates.UTC), "yyyy-mm-ddTHH:MM:SS") * "Z"
     git_hash = _git_hash(vault.config_path)
+    observed = _git_observe(vault.config_path)
+    sha, file = if result === nothing
+        "unknown", "unknown"
+    else
+        String(result.sha256), relpath(result.file, vault.outdir)
+    end
 
-    lines = ["jobid=$jobid_str", "completed=$completed", "git_hash=$git_hash"]
+    lines = [
+        "done_version=2",
+        "jobid=$jobid_str",
+        "completed=$completed",
+        "completed_at=$completed_at",
+        "git_hash=$git_hash",
+        "git_commit_observed=$(observed.commit)",
+        "git_object_format=$(observed.object_format)",
+        "git_observed_at=completion",
+        "result_sha256=$sha",
+        "result_file=$file",
+    ]
     tag_value !== nothing && push!(lines, "tag_value=$tag_value")
 
     write(done, join(lines, "\n") * "\n")

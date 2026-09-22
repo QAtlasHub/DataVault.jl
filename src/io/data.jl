@@ -17,6 +17,53 @@ function load(vault::Vault, key::DataKey; prefix::AbstractString="data")::Dict
 end
 
 """
+    read_done(vault, key) -> Dict{String,String}
+
+The fields of `key`'s `.done` marker, or an empty dict when there is none. Every version-2 field
+is present in a version-2 marker (as `unknown` when it could not be known); a version-1 marker has
+no `done_version`.
+"""
+read_done(vault::Vault, key::DataKey)::Dict{String,String} =
+    _parse_done_file(_done_file(vault, key))
+
+"""
+    load_recorded(vault, key; prefix="data") -> (data, record)
+
+Load `key`'s result the way a report should: copy the file once, hash the copy, load the copy. The
+digest then names exactly the bytes `data` came from — a file replaced while it is being read
+cannot yield the digest of one version and the data of another.
+
+`record` is `(; key, file, read_sha256, result_sha256, observation, completed_at, done_version)`:
+`key` is `canonical(key)`, `file` is relative to the outdir, `read_sha256` is what was read, and
+the rest is what the `.done` marker recorded when the key was computed (`"unknown"` when it did not
+say). `read_sha256 != result_sha256` means the bytes read are not the bytes that computation wrote.
+"""
+function load_recorded(vault::Vault, key::DataKey; prefix::AbstractString="data")
+    path = _data_file(vault, key; prefix=prefix)
+    isfile(path) || error("Data file not found: $path")
+    snapshot = tempname()
+    try
+        cp(path, snapshot)                          # the one read of the published file
+        sha = bytes2hex(open(sha256, snapshot))
+        data = JLD2.load(snapshot)
+        done = read_done(vault, key)
+        field(k) = get(done, k, "unknown")
+        record = (;
+            key=ParamIO.canonical(key),
+            file=relpath(path, vault.outdir),
+            read_sha256=sha,
+            result_sha256=field("result_sha256"),
+            observation=field("observation"),
+            completed_at=field("completed_at"),
+            done_version=get(done, "done_version", isempty(done) ? "unknown" : "1"),
+        )
+        return data, record
+    finally
+        rm(snapshot; force=true)
+    end
+end
+
+"""
     DataVault.tryload(vault, key; prefix="data") -> Union{Dict,Nothing}
 
 The stored dict for `key`, or `nothing` when there is no file. [`load`](@ref) with absence as a

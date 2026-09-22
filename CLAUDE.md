@@ -11,6 +11,9 @@ maps a `DataKey` to file storage and tracks what's done. project-agnostic. See
 - `save!(vault, key, dict) -> (; file, sha256)` / `load(vault, key)` — atomic (NFS-safe) JLD2 IO.
   `sha256` is taken from the temporary file before the rename: pass it on as
   `mark_done!(vault, key; result=save!(…))` so the `.done` marker names the bytes written.
+- `load_recorded(vault, key) -> (data, record)` — what a report should read with: copies the file
+  once, hashes the copy, loads the copy, and returns the marker's `result_sha256` / `observation`
+  beside `read_sha256`. `read_done(vault, key)` is the marker as a dict.
 - `keys(vault; status=:all/:done/:pending)`, `is_done`/`mark_done!`/`mark_running!`.
 - `build_ledger(vault)` → `ledger.csv`; `record_figure`.
 - `attach`/`open_all`/`load_ledger` — read data back later **without knowing the

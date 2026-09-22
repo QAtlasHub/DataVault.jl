@@ -32,6 +32,13 @@ maps a `DataKey` to file storage and tracks what's done. project-agnostic. See
   written. Add a new reader to the registry instead. See `src/util/log_toml.jl`
   and `test/vault/fixtures/`.
 - `outdir` precedence: kwarg > `ENV["DATAVAULT_OUTDIR"]` > config `[study] outdir`.
+- **`observe_sources(vault) -> token` keeps two claims apart.** The SNAPSHOT (`sources/src1-<hex>/`,
+  id = SHA-256 of its `files.tsv`) is content only — no HEAD, no host — so equal trees get equal
+  ids. The OBSERVATION (`observations/<token>.toml`) holds when/where/HEAD/dirty and the
+  **binding**: `loaded-matches-disk` only when packages loaded from the config's repo were
+  checked against the snapshot via their precompile cache headers (size + CRC32c, an internal
+  API — anything unreadable is `unknown`, never a match). Nothing under `.datavault/` may be
+  named `*.log.toml`: discovery walks the tree for that suffix.
 - **`.done` is `key=value` lines, `done_version=2`.** Readers take the keys they know and ignore
   the rest; keys are only ever added. Every v2 field is written on every call (`unknown` rather
   than absent). `git_commit_observed` is the working tree at completion (`git_observed_at`), an

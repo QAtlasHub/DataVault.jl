@@ -104,7 +104,7 @@ end
     try
         w = Vault(_RO_CONFIG; outdir=outdir)
         k = DataVault.keys(w)[1]
-        @test DataVault.save!(w, k, Dict("energy" => 1.0)) === nothing
+        @test isfile(DataVault.save!(w, k, Dict("energy" => 1.0)).file)
         @test acquire_running!(w, k) == :ok
         @test refresh_running!(w, k)
         @test touch_running!(w, k) === nothing

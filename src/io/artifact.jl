@@ -114,12 +114,13 @@ its directory — the same lock and reclaim rule as [`acquire_running!`](@ref). 
 [`ArtifactBusy`](@ref) at once. A builder that throws leaves nothing behind and releases the
 lock, and the error propagates.
 
-**Heartbeat.** The lock is refreshed every `heartbeat_interval` seconds from a separate task, and
-a sibling reclaims it after `stale_after` seconds without one. That task needs a thread the
-build is not occupying: start Julia with an interactive thread (`julia -t N,1`) or `N ≥ 2`.
-On a single thread a long build that does not yield starves it, and after `stale_after` a
-waiting sibling rebuilds the same artifact — wasted work, not a wrong result, since the payload
-is written atomically.
+**Heartbeat.** While `build` runs, a small `sh` child process rewrites the lock's `heartbeat=`
+every `heartbeat_interval` seconds for as long as this process is alive (`kill -0`), and a
+sibling reclaims the lock after `stale_after` seconds without one. It is a separate PROCESS on
+purpose: a task inside Julia does not run while a build computes without yielding — measured,
+a `sleep`-driven task on an interactive thread (`julia -t 1,1`) ticked 0 times in 3 s of a busy
+main thread. So `stale_after` bounds how long a crashed or walltime-killed builder blocks the
+next job, independently of how long a build takes.
 
 A `readonly` vault loads but never builds: a miss throws.
 """
@@ -147,6 +148,7 @@ function artifact!(
     file = _artifact_file(dir)
     lock = _artifact_lock(dir)
     t0 = time()
+    announced = -Inf
 
     while true
         isfile(file) && return _read_artifact(file, id)
@@ -169,6 +171,13 @@ function artifact!(
         end
 
         wait || throw(ArtifactBusy(n, id))
+        # A wait is otherwise silent, and a stale lock can hold it for `stale_after`: say so.
+        if time() - announced >= 600
+            announced = time()
+            @info "artifact!: waiting for \"$n\" to be built elsewhere" identity = id waited_s = round(
+                time() - t0
+            ) stale_after
+        end
         time() - t0 > timeout && error(
             "artifact!: waited $(round(time() - t0; digits=1)) s for \"$n\" to be built " *
             "elsewhere ($id); giving up at timeout=$timeout.",
@@ -180,27 +189,11 @@ end
 function _build_artifact!(
     build, akey, vault, name, id, dir, file, lock, owner, heartbeat_interval
 )
-    stop = Threads.Atomic{Bool}(false)
-    pool = Threads.nthreads(:interactive) > 0 ? :interactive : :default
-    hb = Threads.@spawn pool begin
-        elapsed = 0.0
-        while !stop[]
-            sleep(0.1)
-            elapsed += 0.1
-            if elapsed >= heartbeat_interval
-                elapsed = 0.0
-                try
-                    _refresh_lock_at!(lock, owner)
-                catch
-                end
-            end
-        end
-    end
+    hb = _start_heartbeat(lock, owner, heartbeat_interval)
     value = try
         build(akey)
     finally
-        stop[] = true
-        Base.wait(hb)
+        _stop_heartbeat(hb)
     end
 
     # `inputs.toml` first, so that when `artifact.jld2` appears — atomically, by `mv` — its
@@ -225,3 +218,35 @@ end
 _toml_safe(v::Union{Bool,Integer,AbstractFloat,AbstractString}) = v
 _toml_safe(v::AbstractVector) = [_toml_safe(x) for x in v]
 _toml_safe(v) = repr(v)
+
+# The heartbeat as a child process: refresh `heartbeat=` in `lock` every `interval` seconds while
+# the parent pid lives and the lock is still `owner`'s. Arguments go in as `$1..$4`, never
+# spliced into the script, so no path or token needs quoting. The rewrite goes through a temp file
+# and `mv`, so a reader never sees half a file.
+const _HEARTBEAT_SH = raw"""
+pid=$1; interval=$2; lock=$3; owner=$4
+while kill -0 "$pid" 2>/dev/null; do
+    sleep "$interval"
+    grep -qx "owner=$owner" "$lock" 2>/dev/null || exit 0
+    hb=$(date '+%Y-%m-%dT%H:%M:%S')
+    tmp="$lock.hb.$$"
+    awk -v hb="$hb" '/^heartbeat=/ { print "heartbeat=" hb; next } { print }' "$lock" > "$tmp" &&
+        mv -f "$tmp" "$lock"
+done
+"""
+
+function _start_heartbeat(lock::AbstractString, owner::AbstractString, interval::Real)
+    Sys.iswindows() && return nothing       # no `sh`: the lock then ages out after `stale_after`
+    cmd = `sh -c $_HEARTBEAT_SH sh $(getpid()) $(interval) $lock $owner`
+    return run(pipeline(cmd; stdout=devnull, stderr=devnull); wait=false)
+end
+
+function _stop_heartbeat(p)
+    p === nothing && return nothing
+    try
+        kill(p)
+        Base.wait(p)
+    catch
+    end
+    return nothing
+end

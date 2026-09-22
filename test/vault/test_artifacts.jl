@@ -1,6 +1,6 @@
 # [artifacts.<name>] — built once per identity, reused across cells, vaults and runs.
 
-using DataVault, ParamIO, Test, JLD2, TOML
+using DataVault, ParamIO, Test, JLD2, TOML, Dates
 
 function _av_config(dir; version=1, depends_on="[\"U\", \"D\"]")
     path = joinpath(dir, "config_v$(version).toml")
@@ -150,5 +150,27 @@ end
         jldsave(f; value=:wrong, identity="gs@v1|something else")
         @test_throws ErrorException load_artifact(v, :gs, k)
         @test_throws ErrorException artifact!(_gs, v, :gs, k)
+    end
+end
+
+@testset "artifact!: the heartbeat advances while a build computes without yielding" begin
+    # The reason the heartbeat is a child PROCESS: a task inside Julia does not run here. Under
+    # the old in-process task this age was the whole build (≈ 3 s); a live heartbeat keeps it
+    # within an interval plus the lock's one-second resolution.
+    with_av() do dir, v
+        k = first(DataVault.keys(v))
+        lock = joinpath(DataVault.artifact_dir(v, :gs, k), ".building")
+        age = artifact!(v, :gs, k; heartbeat_interval=0.3, stale_after=10.0) do _
+            t0 = time()
+            x = 0.0
+            while time() - t0 < 3.0
+                for i in 1:(10 ^ 6)
+                    x += sin(i)
+                end
+            end
+            line = only(filter(startswith("heartbeat="), readlines(lock)))
+            (Dates.now() - Dates.DateTime(line[11:end], "yyyy-mm-ddTHH:MM:SS")).value / 1000
+        end
+        @test age < 2.0
     end
 end

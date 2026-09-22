@@ -38,9 +38,12 @@ maps a `DataKey` to file storage and tracks what's done. project-agnostic. See
 - **`observe_sources(vault) -> token` keeps two claims apart.** The SNAPSHOT (`sources/src1-<hex>/`,
   id = SHA-256 of its `files.tsv`) is content only — no HEAD, no host — so equal trees get equal
   ids. The OBSERVATION (`observations/<token>.toml`) holds when/where/HEAD/dirty and the
-  **binding**: `loaded-matches-disk` only when packages loaded from the config's repo were
-  checked against the snapshot via their precompile cache headers (size + CRC32c, an internal
-  API — anything unreadable is `unknown`, never a match). Nothing under `.datavault/` may be
+  **binding**, which never claims a match: `loaded-differs-from-disk` when a loaded package's
+  precompile-cache sources (size + CRC32c, an internal API — anything unreadable is `unknown`)
+  differ from the snapshot, otherwise `unverified`. Loaded packages matching does not show the
+  code that ran was theirs (a script, a closure, a method added to Base from `Main` leave no
+  trace; `Base._included_files` records no run-time include), so `loaded-matches-disk` is never
+  written; an old record's is read as `unverified`. Nothing under `.datavault/` may be
   named `*.log.toml`: discovery walks the tree for that suffix.
 - **`.done` is `key=value` lines, `done_version=2`.** Readers take the keys they know and ignore
   the rest; keys are only ever added. Every v2 field is written on every call (`unknown` rather

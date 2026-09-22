@@ -48,7 +48,7 @@ export acquire_running!, refresh_running!, running_age_secs
 export new_owner_token, running_owner
 export artifact!, has_artifact, load_artifact, tryload_artifact, ArtifactBusy
 export build_ledger, record_figure, cleanup_stale
-export observe_sources
+export observe_sources, load_recorded, read_done
 export archive_figure!, list_figure_history, restore_figure!
 export build_experiment_report, build_experiments_index, gather_code_versions
 export read_schema_record, check_schema_compat

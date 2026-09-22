@@ -376,6 +376,14 @@ function entry_code_reasons(code, roots, status)::Vector{String}
             reasons,
             "$name captures values (a closure or a callable struct), which cannot be checked",
         )
+        if nameof(parentmodule(f)) === :__deserialized_types__
+            push!(
+                reasons,
+                "$name arrived from another process (a closure sent by the master), so its " *
+                "code is that process's and cannot be checked here",
+            )
+            continue
+        end
         top = Base.moduleroot(parentmodule(f))
         if top === Main
             push!(

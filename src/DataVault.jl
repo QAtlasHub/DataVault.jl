@@ -26,6 +26,8 @@ module DataVault
 
 using JLD2, TOML, Dates, Printf
 using SHA
+using CRC32c: crc32c
+using Random: Random
 using JSON3
 using ParamIO
 
@@ -46,6 +48,7 @@ export acquire_running!, refresh_running!, running_age_secs
 export new_owner_token, running_owner
 export artifact!, has_artifact, load_artifact, tryload_artifact, ArtifactBusy
 export build_ledger, record_figure, cleanup_stale
+export observe_sources
 export archive_figure!, list_figure_history, restore_figure!
 export build_experiment_report, build_experiments_index, gather_code_versions
 export read_schema_record, check_schema_compat
@@ -74,6 +77,8 @@ include("util/snapshot.jl")    # vault.jl の constructor から呼ばれる
 include("util/enumerate.jl")
 include("util/cleanup.jl")
 include("util/query.jl")       # attach / open_all / load_ledger / build_master_ledger
+
+include("provenance/observe.jl")   # source snapshots and their binding to loaded code
 
 include("reporting/ledger.jl")
 include("reporting/figure.jl")

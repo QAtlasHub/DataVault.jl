@@ -23,12 +23,14 @@ using Printf: @sprintf
 is_done(vault::Vault, key::DataKey)::Bool = isfile(_done_file(vault, key))
 
 """
-    mark_done!(vault, key; jobid=nothing, tag_value=nothing, result=nothing)
+    mark_done!(vault, key; jobid=nothing, tag_value=nothing, result=nothing, observation=nothing)
 
 Write a `.done` file for `key`. Removes the corresponding `.running` file if present.
 
 `result` is what [`save!`](@ref) returned for this key. Pass it: it is the only way the marker can
-name the bytes that were written.
+name the bytes that were written. `observation` is the token [`observe_sources`](@ref) returned in
+the process that computed the key; the marker records it, and the observation says how far that
+process's loaded code was checked against its source snapshot.
 
 Fields written (`done_version=2`), every one of them on every call:
 
@@ -41,10 +43,16 @@ Fields written (`done_version=2`), every one of them on every call:
 | `git_commit_observed`, `git_object_format` | full HEAD and object format, or `unknown` |
 | `git_observed_at` | `completion`: the working tree seen now, not the code the process loaded |
 | `result_sha256`, `result_file` | from `result` (file relative to the outdir), or `unknown` |
+| `observation` | the token of the computing process's source observation, or `unknown` |
 | `tag_value` | only when given |
 """
 function mark_done!(
-    vault::Vault, key::DataKey; jobid=nothing, tag_value=nothing, result=nothing
+    vault::Vault,
+    key::DataKey;
+    jobid=nothing,
+    tag_value=nothing,
+    result=nothing,
+    observation=nothing,
 )
     _refuse_if_readonly(vault, "mark_done!")
     done = _done_file(vault, key)
@@ -79,6 +87,7 @@ function mark_done!(
         "git_observed_at=completion",
         "result_sha256=$sha",
         "result_file=$file",
+        "observation=$(observation === nothing ? "unknown" : observation)",
     ]
     tag_value !== nothing && push!(lines, "tag_value=$tag_value")
 

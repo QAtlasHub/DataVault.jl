@@ -16,7 +16,8 @@
 
 const SOURCE_RECIPE = "src1"
 const OBSERVATION_VERSION = 1
-const MATERIALIZE_EXTENSIONS = (".jl", ".toml")    # contents kept; every other file inventoried only
+const MATERIALIZE_EXTENSIONS = (".jl", ".toml")    # contents always kept, at any size up to the hash limit
+const DEFAULT_MATERIALIZE_LIMIT = 1024^2             # any other file: contents kept up to this size
 const DEFAULT_HASH_LIMIT = 64 * 1024^2               # larger files are inventoried without a digest
 const ENV_RECORDED = (
     "JULIA_NUM_THREADS",
@@ -55,28 +56,68 @@ _inside(path, dir) = startswith(_real(path), rstrip(_real(dir), '/') * "/")
 
 # ── roots ─────────────────────────────────────────────────────────────────────────────────────
 
-# The config's repository (or directory), and every `path` dependency of the active environment
-# that is not already inside it. Names are logical — no absolute path enters the snapshot.
-function _source_roots(vault::Vault)
+# The study, every `path` dependency of the active environment that is not already inside it, and —
+# when `depot` — every package this process loaded from a depot. Names are logical: no absolute
+# path enters the snapshot.
+#
+# The study is the active environment's directory when the config lies inside it (a study that
+# carries its own Project.toml, so that a repository of many studies does not capture them all),
+# and otherwise the config's repository, or its directory outside git.
+function _source_roots(vault::Vault; depot::Bool=false)
     cfg = dirname(abspath(vault.config_path))
     top = _git_read(cfg, "rev-parse", "--show-toplevel")
-    roots = [
-        if top === nothing
-            (name="config", dir=cfg, kind=:plain)
-        else
-            (name="config", dir=top, kind=:git)
-        end,
-    ]
+    project = Base.active_project()
+    envdir = project === nothing ? nothing : dirname(abspath(project))
+    study = if envdir !== nothing && (_inside(cfg, envdir) || _real(cfg) == _real(envdir))
+        envdir
+    else
+        something(top, cfg)
+    end
+    roots = Any[(name="config", dir=study, kind=top === nothing ? :plain : :git, tree="")]
     for dep in _path_dependencies()
         any(r -> _inside(dep.path, r.dir) || _real(dep.path) == _real(r.dir), roots) &&
             continue
         ingit = _git_read(dep.path, "rev-parse", "--show-toplevel") !== nothing
         push!(
             roots,
-            (name="pkg:$(dep.name):$(dep.uuid)", dir=dep.path, kind=ingit ? :git : :plain),
+            (
+                name="pkg:$(dep.name):$(dep.uuid)",
+                dir=dep.path,
+                kind=ingit ? :git : :plain,
+                tree="",
+            ),
         )
     end
+    depot && append!(roots, _depot_roots(roots))
     return roots
+end
+
+# Every package this process loaded from a depot (`packages/<name>/<slug>`), with the tree hash the
+# active Manifest pins it to. These are what a registered or git-URL dependency is: a tree that
+# only a registry, a package server or a git remote can give back, so the snapshot keeps it.
+function _depot_roots(existing)
+    manifest = _active_manifest()
+    manifest === nothing && return Any[]
+    pinned = Dict{String,String}()
+    for (_, entries) in get(TOML.parsefile(manifest), "deps", Dict{String,Any}()),
+        e in entries
+
+        haskey(e, "git-tree-sha1") &&
+            haskey(e, "uuid") &&
+            (pinned[e["uuid"]] = e["git-tree-sha1"])
+    end
+    depots = [joinpath(_real(d), "packages") for d in DEPOT_PATH if isdir(d)]
+    out = Any[]
+    for (id, origin) in Base.pkgorigins
+        (id.uuid === nothing || origin.path === nothing) && continue
+        tree = get(pinned, string(id.uuid), nothing)
+        tree === nothing && continue
+        any(d -> _inside(origin.path, d), depots) || continue
+        dir = dirname(dirname(origin.path))                     # <slug>/src/<name>.jl → <slug>
+        any(r -> _real(r.dir) == _real(dir) || _inside(dir, r.dir), existing) && continue
+        push!(out, (name="pkg:$(id.name):$(id.uuid)", dir=dir, kind=:depot, tree=tree))
+    end
+    return sort!(out; by=r -> r.name)
 end
 
 const _PathDep = NamedTuple{(:name, :uuid, :path),NTuple{3,String}}
@@ -108,20 +149,28 @@ end
 
 # ── inventory ─────────────────────────────────────────────────────────────────────────────────
 
-function _root_files(root)::Union{Vector{String},Nothing}
+# Relative to the root. Anything under `exclude` (the vault's own output) is not source, even when
+# it sits inside the study and nothing ignores it.
+function _root_files(root; exclude=nothing)::Union{Vector{String},Nothing}
+    keep(rel) = exclude === nothing || !_inside(joinpath(root.dir, rel), exclude)
     if root.kind === :git
         out = _git_read(
             root.dir, "ls-files", "-z", "--cached", "--others", "--exclude-standard"
         )
         out === nothing && return nothing
-        return sort!(unique!(filter!(!isempty, String.(split(out, '\0')))))
+        return sort!(filter!(keep, unique!(filter!(!isempty, String.(split(out, '\0'))))))
     end
     files = String[]
     for (dir, dirs, fs) in walkdir(root.dir)
         filter!(d -> d != ".git", dirs)
+        # Do not walk into the output at all: it can be far larger than the study.
+        exclude === nothing || filter!(dirs) do d
+            p = joinpath(dir, d)
+            return !(_real(p) == _real(exclude) || _inside(p, exclude))
+        end
         append!(files, relpath(joinpath(dir, f), root.dir) for f in fs)
     end
-    return sort!(files)
+    return sort!(filter!(keep, files))
 end
 
 struct SourceEntry
@@ -135,7 +184,15 @@ struct SourceEntry
     full::String
 end
 
-function _entry(root, rel, hash_limit, blobs, notes)::SourceEntry
+# A file's contents are kept when it is `.jl`/`.toml` (at any size up to the hash limit) or no
+# larger than `materialize_limit`: the snapshot must hold what a package reads besides its code (a
+# table, a template, a script), and an extension list drops those without a word.
+function _materialize(rel, size, limit)
+    return size <= limit ||
+           any(ext -> endswith(lowercase(rel), ext), MATERIALIZE_EXTENSIONS)
+end
+
+function _entry(root, rel, hash_limit, blobs, notes; materialize_limit)::SourceEntry
     full = joinpath(root.dir, rel)
     st = lstat(full)
     if islink(st)
@@ -160,8 +217,7 @@ function _entry(root, rel, hash_limit, blobs, notes)::SourceEntry
         end
         bytes = read(full)
         sha = bytes2hex(sha256(bytes))
-        any(ext -> endswith(lowercase(rel), ext), MATERIALIZE_EXTENSIONS) &&
-            (blobs[sha] = bytes)
+        _materialize(rel, length(bytes), materialize_limit) && (blobs[sha] = bytes)
         return SourceEntry(
             root.name, rel, "file", mode, length(bytes), sha, crc32c(bytes), full
         )
@@ -172,17 +228,22 @@ function _entry(root, rel, hash_limit, blobs, notes)::SourceEntry
     return SourceEntry(root.name, rel, "missing", "-", 0, "", 0x00000000, full)
 end
 
-function _inventory(roots; hash_limit::Integer)
+function _inventory(
+    roots; hash_limit::Integer, materialize_limit::Integer=0, exclude=nothing
+)
     entries = SourceEntry[]
     blobs = Dict{String,Vector{UInt8}}()
     notes = String[]
     for root in roots
-        files = _root_files(root)
+        files = _root_files(root; exclude)
         if files === nothing
             push!(notes, "$(root.name): files could not be listed")
             continue
         end
-        append!(entries, _entry(root, rel, hash_limit, blobs, notes) for rel in files)
+        append!(
+            entries,
+            _entry(root, rel, hash_limit, blobs, notes; materialize_limit) for rel in files
+        )
     end
     return entries, blobs, notes
 end
@@ -352,8 +413,16 @@ function _root_record(root, loaded::String)::Dict{String,Any}
         observed = _git_observe(root.dir)
         record["head"] = observed.commit
         record["object_format"] = observed.object_format
-        porcelain = _git_read(root.dir, "status", "--porcelain", "--untracked-files=all")
+        porcelain = _git_read(
+            root.dir, "status", "--porcelain", "--untracked-files=all", "--", "."
+        )
         record["dirty"] = porcelain === nothing ? "unknown" : string(!isempty(porcelain))
+    elseif root.kind === :depot
+        # The tree the Manifest pins. Whether the directory still hashes to it is for a restore
+        # to check: a depot is not written to after install, but nothing here proves it.
+        record["head"] = root.tree
+        record["object_format"] = "sha1"
+        record["dirty"] = "unknown"
     else
         record["head"] = record["object_format"] = record["dirty"] = "unknown"
     end
@@ -376,7 +445,8 @@ end
 
 function _julia_record()::Dict{String,Any}
     opts = Base.JLOptions()
-    return Dict{String,Any}(
+    exe = joinpath(Sys.BINDIR, Base.julia_exename())
+    record = Dict{String,Any}(
         "version" => string(VERSION),
         "commit" => Base.GIT_VERSION_INFO.commit,
         "image_file" => opts.image_file == C_NULL ? "" : unsafe_string(opts.image_file),
@@ -384,40 +454,71 @@ function _julia_record()::Dict{String,Any}
         "opt_level" => Int(opts.opt_level),
         "fast_math" => Int(opts.fast_math),
         "threads" => Threads.nthreads(),
+        # Which binary, not only which version: a launcher (juliaup) given the same command in
+        # another HOME starts another Julia. The digest is of the binary itself.
+        "bindir" => Sys.BINDIR,
+        "platform" => Base.BinaryPlatforms.triplet(Base.BinaryPlatforms.HostPlatform()),
+        "cpu_name" => Sys.CPU_NAME,
+        # BLAS's own thread count, whatever set it: results differ in the last bits between
+        # counts, so a bitwise comparison is only meaningful at the one recorded here.
+        "blas_threads" => LinearAlgebra.BLAS.get_num_threads(),
+        "blas_libraries" =>
+            [basename(l.libname) for l in LinearAlgebra.BLAS.get_config().loaded_libs],
     )
+    isfile(exe) && (record["executable_sha256"] = bytes2hex(open(sha256, exe)))
+    return record
 end
 
 """
-    observe_sources(vault; phase = "run-start", process = Dict(), hash_limit = 64 MiB) -> token
+    observe_sources(vault; phase = "run-start", process = Dict(), hash_limit = 64 MiB,
+                    materialize_limit = 1 MiB, depot_packages = (phase == "run-start")) -> token
 
-Observe the source roots this process can see — the config's repository and every `path`
-dependency of the active environment — store the snapshot (once per distinct content) and an
-observation record, and return the record's token for [`mark_done!`](@ref)'s `observation`.
+Observe the source roots this process can see, store the snapshot (once per distinct content) and
+an observation record, and return the record's token for [`mark_done!`](@ref)'s `observation`.
+
+The roots are the study (the active environment's directory when the config lies inside it,
+otherwise the config's repository), every `path` dependency of the active environment, and, when
+`depot_packages`, every package this process loaded from a depot, recorded as a `depot` root whose
+`head` is the tree hash the Manifest pins. The vault's own output directory is never source.
 
 The record says when (`observed_at`, `phase`), where (host, pid, and whatever `process` adds, such
 as a worker id), which snapshot (`source`), each root's git HEAD and whether it was dirty, the Julia
-build and a fixed list of environment variables, and the **binding**: how far the code this process
-has loaded was checked against the snapshot (see [`binding_of`](@ref)). File contents are stored
-only for `.jl` and `.toml` files; every other file is inventoried by size and digest.
+build (with the binary's digest, the platform and BLAS's thread count) and a fixed list of
+environment variables, and the **binding**: how far the code this process has loaded was checked
+against the snapshot (see [`binding_of`](@ref)). File contents are stored for `.jl` and `.toml`
+files and for any file up to `materialize_limit`; every file is inventoried by size and digest.
+
+Depot packages are kept at `run-start` only by default: that is the process that computed, and a
+render's plotting stack is large and not what a recomputation needs.
 """
 function observe_sources(
     vault::Vault;
     phase::AbstractString="run-start",
     process::AbstractDict=Dict{String,Any}(),
     hash_limit::Integer=DEFAULT_HASH_LIMIT,
+    materialize_limit::Integer=DEFAULT_MATERIALIZE_LIMIT,
+    depot_packages::Bool=(phase == "run-start"),
 )::String
     _refuse_if_readonly(vault, "observe_sources")
     observed_at = _utc_stamp()
-    roots = _source_roots(vault)
-    entries, blobs, notes = _inventory(roots; hash_limit)
+    roots = _source_roots(vault; depot=depot_packages)
+    entries, blobs, notes = _inventory(
+        roots; hash_limit, materialize_limit, exclude=vault.outdir
+    )
     complete =
         !any(e -> e.sha256 == "skipped" || e.type == "dir", entries) &&
         !any(n -> occursin("could not be listed", n), notes)
     state = Dict{String,Any}(
         "recipe" => SOURCE_RECIPE,
-        "roots" => [Dict("name" => r.name, "kind" => String(r.kind)) for r in roots],
+        "roots" => [
+            merge(
+                Dict("name" => r.name, "kind" => String(r.kind)),
+                isempty(r.tree) ? Dict{String,String}() : Dict("tree" => r.tree),
+            ) for r in roots
+        ],
         "inventory_complete" => complete,
         "materialized" => collect(MATERIALIZE_EXTENSIONS),
+        "materialize_limit" => materialize_limit,
         "notes" => notes,
     )
     source = _publish_snapshot(vault, _files_tsv(entries), state, blobs)

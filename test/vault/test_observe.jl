@@ -67,13 +67,111 @@ config_root(rec) = only(r for r in rec["roots"] if r["name"] == "config")
     end
 end
 
-@testset "observe_sources: only .jl and .toml contents are kept" begin
+@testset "observe_sources: contents are kept by size, and .jl/.toml at any size" begin
+    sha(file) = bytes2hex(sha256(read(file)))
     with_observed_repo() do t
         observe_sources(t.vault)
         blobs = joinpath(obs_dir(t), "sources", "blobs")
-        sha(file) = bytes2hex(sha256(read(file)))
+        @test isfile(joinpath(blobs, sha(joinpath(t.pkg, "src", "$(t.name).jl"))))
+        # A data file a package reads is source too; an extension list would drop it silently.
+        @test isfile(joinpath(blobs, sha(joinpath(t.repo, "notes.dat"))))
+    end
+    with_observed_repo() do t
+        r = record(t, observe_sources(t.vault; materialize_limit=4))
+        blobs = joinpath(obs_dir(t), "sources", "blobs")
         @test isfile(joinpath(blobs, sha(joinpath(t.pkg, "src", "$(t.name).jl"))))
         @test !isfile(joinpath(blobs, sha(joinpath(t.repo, "notes.dat"))))
+        state = TOML.parsefile(joinpath(obs_dir(t), "sources", r["source"], "state.toml"))
+        @test state["materialize_limit"] == 4
+    end
+end
+
+@testset "observe_sources: the vault's own output inside the study is not source" begin
+    repo = mktempdir()
+    try
+        cp(_OBS_CFG, joinpath(repo, "study.toml"))
+        out = joinpath(repo, "out")                     # inside the study, ignored by nothing
+        v = Vault(joinpath(repo, "study.toml"); outdir=out)
+        k = DataVault.keys(v)[1]
+        mark_done!(v, k; result=DataVault.save!(v, k, Dict("x" => 1.0)))
+        store = joinpath(out, ".datavault", "test_study")
+        r = TOML.parsefile(joinpath(store, "observations", "$(observe_sources(v)).toml"))
+        tsv = read(joinpath(store, "sources", r["source"], "files.tsv"), String)
+        @test occursin("config\tstudy.toml\t", tsv)
+        @test !occursin("config\tout/", tsv)
+    finally
+        rm(repo; recursive=true, force=true)
+    end
+end
+
+@testset "observe_sources: a study with its own environment is its own root" begin
+    with_observed_repo() do t
+        study = joinpath(t.repo, "studies", "one")
+        mkpath(study)
+        cp(_OBS_CFG, joinpath(study, "study.toml"))
+        write(joinpath(study, "Project.toml"), "[deps]\n")
+        write(joinpath(t.repo, "studies", "other.jl"), "x = 1\n")   # a neighbour, not this study
+        git!(t.repo, "add", "-A")
+        git!(t.repo, "commit", "-qm", "studies")
+        before = Base.active_project()
+        Base.set_active_project(joinpath(study, "Project.toml"))
+        try
+            v = Vault(joinpath(study, "study.toml"); outdir=t.out)
+            r = record(t, observe_sources(v))
+            tsv = read(joinpath(obs_dir(t), "sources", r["source"], "files.tsv"), String)
+            @test occursin("config\tstudy.toml\t", tsv)
+            @test occursin("config\tProject.toml\t", tsv)
+            @test !occursin("other.jl", tsv) && !occursin("notes.dat", tsv)
+            c = config_root(r)
+            @test c["kind"] == "git"
+            @test c["head"] == readchomp(`git -C $(t.repo) rev-parse HEAD`)
+            @test c["dirty"] == "false"
+            write(joinpath(t.repo, "notes.dat"), "changed outside the study")
+            @test config_root(record(t, observe_sources(v)))["dirty"] == "false"
+        finally
+            Base.set_active_project(before)
+        end
+    end
+end
+
+@testset "observe_sources: the packages a computing process loaded are kept" begin
+    with_observed_repo() do t
+        manifest = DataVault._active_manifest()
+        pinned = Dict{String,String}()
+        if manifest !== nothing
+            for (_, es) in TOML.parsefile(manifest)["deps"], e in es
+                haskey(e, "git-tree-sha1") && (pinned[e["uuid"]] = e["git-tree-sha1"])
+            end
+        end
+        # JLD2 is loaded by DataVault itself, from a depot, whenever these tests run.
+        uuid = "033835bb-8acc-5ee8-8aae-3f567f8a3819"
+        r = record(t, observe_sources(t.vault))
+        if haskey(pinned, uuid)
+            j = only(x for x in r["roots"] if x["name"] == "pkg:JLD2:$uuid")
+            @test j["kind"] == "depot" && j["head"] == pinned[uuid]
+            snap = joinpath(obs_dir(t), "sources", r["source"])
+            @test occursin(
+                "pkg:JLD2:$uuid\tsrc/JLD2.jl\tfile",
+                read(joinpath(snap, "files.tsv"), String),
+            )
+            state = TOML.parsefile(joinpath(snap, "state.toml"))
+            @test any(x -> get(x, "tree", "") == j["head"], state["roots"])
+        else
+            @test_broken haskey(pinned, uuid)        # JLD2 is not pinned by a tree here
+        end
+        # A render is not the computing process: its plotting stack is not kept by default.
+        rr = record(t, observe_sources(t.vault; phase="render"))
+        @test !any(x -> x["kind"] == "depot", rr["roots"])
+    end
+end
+
+@testset "observe_sources: which Julia binary, and BLAS's thread count" begin
+    with_observed_repo() do t
+        j = record(t, observe_sources(t.vault))["julia"]
+        @test j["blas_threads"] == DataVault.LinearAlgebra.BLAS.get_num_threads()
+        @test occursin(r"^[0-9a-f]{64}$", j["executable_sha256"])
+        @test j["bindir"] == Sys.BINDIR
+        @test !isempty(j["platform"]) && !isempty(j["blas_libraries"])
     end
 end
 
@@ -147,10 +245,12 @@ end
         k = DataVault.keys(v)[1]
         token = observe_sources(v)
         mark_done!(v, k; result=DataVault.save!(v, k, Dict("x" => 1.0)), observation=token)
-        line(key) = only(
-            l for
-            l in eachline(DataVault._done_file(v, key)) if startswith(l, "observation=")
-        )
+        function line(key)
+            return only(
+                l for
+                l in eachline(DataVault._done_file(v, key)) if startswith(l, "observation=")
+            )
+        end
         @test line(k) == "observation=$token"
         k2 = DataVault.keys(v)[2]
         mark_done!(v, k2)

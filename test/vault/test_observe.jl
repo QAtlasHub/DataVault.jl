@@ -165,6 +165,23 @@ end
     end
 end
 
+@testset "observe_sources: a symlink's target is kept, and so are the artifacts loaded" begin
+    with_observed_repo() do t
+        symlink("notes.dat", joinpath(t.repo, "link.dat"))
+        r = record(t, observe_sources(t.vault))
+        blobs = joinpath(obs_dir(t), "sources", "blobs")
+        @test isfile(joinpath(blobs, bytes2hex(sha256("notes.dat"))))
+        @test read(joinpath(blobs, bytes2hex(sha256("notes.dat"))), String) == "notes.dat"
+        # Every artifact root is named by, and pinned to, its tree; and it is one that a loaded
+        # depot package's Artifacts.toml selects.
+        for a in (x for x in r["roots"] if x["kind"] == "artifact")
+            @test startswith(a["name"], "artifact:") && endswith(a["name"], ":" * a["head"])
+            @test isdir(a["dir"]) && basename(a["dir"]) == a["head"]
+        end
+        @test haskey(r, "program")
+    end
+end
+
 @testset "observe_sources: which Julia binary, and BLAS's thread count" begin
     with_observed_repo() do t
         j = record(t, observe_sources(t.vault))["julia"]

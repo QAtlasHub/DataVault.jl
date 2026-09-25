@@ -117,7 +117,45 @@ function _depot_roots(existing)
         any(r -> _real(r.dir) == _real(dir) || _inside(dir, r.dir), existing) && continue
         push!(out, (name="pkg:$(id.name):$(id.uuid)", dir=dir, kind=:depot, tree=tree))
     end
+    append!(out, _artifact_roots(out))
     return sort!(out; by=r -> r.name)
+end
+
+# The artifacts those packages' `Artifacts.toml` select for this platform, where installed: a JLL
+# loads a library from `artifacts/<tree>`, which no package tree holds. Named by their tree hash,
+# which is also their directory's name, so a restore knows where each goes and what it must hash to.
+function _artifact_roots(packages)
+    out = Any[]
+    seen = Set{String}()
+    platform = Base.BinaryPlatforms.HostPlatform()
+    for p in packages
+        toml = joinpath(p.dir, "Artifacts.toml")
+        isfile(toml) || continue
+        dict = try
+            TOML.parsefile(toml)
+        catch
+            continue
+        end
+        for name in sort!(collect(keys(dict)))
+            meta = try
+                Artifacts.artifact_meta(name, dict, toml; platform)
+            catch
+                nothing
+            end
+            (meta === nothing || !haskey(meta, "git-tree-sha1")) && continue
+            tree = meta["git-tree-sha1"]
+            tree in seen && continue
+            dir = nothing
+            for d in DEPOT_PATH
+                cand = joinpath(d, "artifacts", tree)
+                isdir(cand) && (dir = cand; break)
+            end
+            dir === nothing && continue                        # lazy and never fetched
+            push!(seen, tree)
+            push!(out, (name="artifact:$name:$tree", dir=dir, kind=:artifact, tree=tree))
+        end
+    end
+    return out
 end
 
 const _PathDep = NamedTuple{(:name, :uuid, :path),NTuple{3,String}}
@@ -195,8 +233,14 @@ end
 function _entry(root, rel, hash_limit, blobs, notes; materialize_limit)::SourceEntry
     full = joinpath(root.dir, rel)
     st = lstat(full)
+    # A package or artifact from a depot is kept whole: it is what only its origin could give
+    # back, and a library in it is routinely larger than any limit meant for a study's files.
+    root.kind in (:depot, :artifact) && (materialize_limit = hash_limit)
     if islink(st)
         target = readlink(full)
+        # The link's target is its content; kept, so that a library's `libx.so -> libx.so.1`
+        # can be laid out again.
+        blobs[bytes2hex(sha256(target))] = Vector{UInt8}(target)
         return SourceEntry(
             root.name,
             rel,
@@ -417,7 +461,7 @@ function _root_record(root, loaded::String)::Dict{String,Any}
             root.dir, "status", "--porcelain", "--untracked-files=all", "--", "."
         )
         record["dirty"] = porcelain === nothing ? "unknown" : string(!isempty(porcelain))
-    elseif root.kind === :depot
+    elseif root.kind in (:depot, :artifact)
         # The tree the Manifest pins. Whether the directory still hashes to it is for a restore
         # to check: a depot is not written to after install, but nothing here proves it.
         record["head"] = root.tree
@@ -550,6 +594,8 @@ function observe_sources(
             Dict{String,Any}(String(k) => v for (k, v) in process),
         ),
         "julia" => _julia_record(),
+        # The script `julia <file>` ran: not among `main_files`, which only lists includes.
+        "program" => isempty(PROGRAM_FILE) ? "" : abspath(PROGRAM_FILE),
         "env" => Dict{String,Any}(k => ENV[k] for k in ENV_RECORDED if haskey(ENV, k)),
         "environment" => _environment_record(vault),
         "revise_loaded" => revise,

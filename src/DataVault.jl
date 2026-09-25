@@ -29,6 +29,7 @@ using SHA
 using CRC32c: crc32c
 using Random: Random
 using LinearAlgebra: LinearAlgebra
+using Artifacts: Artifacts
 using JSON3
 using ParamIO
 

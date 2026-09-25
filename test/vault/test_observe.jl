@@ -182,6 +182,70 @@ end
     end
 end
 
+@testset "observe_sources: an artifact that cannot be resolved is said, not dropped" begin
+    pkg = mktempdir()
+    try
+        fake = (
+            name="pkg:Fake:00000000-0000-0000-0000-000000000000",
+            dir=pkg,
+            kind=:depot,
+            tree="",
+        )
+        # Unreadable: a note, which the observation turns into an incomplete inventory.
+        write(joinpath(pkg, "Artifacts.toml"), "this is [[ not toml")
+        notes = String[]
+        @test isempty(DataVault._artifact_roots([fake], notes))
+        @test any(n -> occursin("Artifacts.toml could not be resolved", n), notes)
+        # Readable but never fetched (lazy): nothing to keep, and nothing wrong either.
+        write(joinpath(pkg, "Artifacts.toml"), "[foo]\ngit-tree-sha1 = \"$("0"^40)\"\n")
+        notes = String[]
+        @test isempty(DataVault._artifact_roots([fake], notes)) && isempty(notes)
+    finally
+        rm(pkg; recursive=true)
+    end
+end
+
+@testset "observe_sources: a depot package is kept whole, whatever the size limit" begin
+    with_observed_repo() do t
+        uuid = "033835bb-8acc-5ee8-8aae-3f567f8a3819"      # JLD2, loaded from a depot
+        r = record(t, observe_sources(t.vault; materialize_limit=1))
+        snap = joinpath(obs_dir(t), "sources", r["source"])
+        rows = [
+            split(l, '\t') for
+            l in eachline(joinpath(snap, "files.tsv")) if startswith(l, "pkg:JLD2:$uuid\t")
+        ]
+        if isempty(rows)
+            @test_broken !isempty(rows)                    # JLD2 not from a depot here
+        else
+            # A file that is neither .jl nor .toml and larger than the 1-byte limit.
+            other = [
+                x for x in rows if x[3] == "file" &&
+                    parse(Int, x[5]) > 1 &&
+                    !endswith(x[2], ".jl") &&
+                    !endswith(x[2], ".toml") &&
+                    x[6] != "skipped"
+            ]
+            @test !isempty(other)
+            @test all(x -> isfile(joinpath(obs_dir(t), "sources", "blobs", x[6])), other)
+        end
+    end
+end
+
+@testset "observe_sources: `program` is the script `julia <file>` ran" begin
+    with_observed_repo() do t
+        script = joinpath(t.repo, "run.jl")
+        before = PROGRAM_FILE
+        @eval Base PROGRAM_FILE = $script
+        try
+            @test record(t, observe_sources(t.vault))["program"] == abspath(script)
+        finally
+            @eval Base PROGRAM_FILE = $before
+        end
+        @test record(t, observe_sources(t.vault))["program"] ==
+            (isempty(before) ? "" : abspath(before))
+    end
+end
+
 @testset "observe_sources: which Julia binary, and BLAS's thread count" begin
     with_observed_repo() do t
         j = record(t, observe_sources(t.vault))["julia"]

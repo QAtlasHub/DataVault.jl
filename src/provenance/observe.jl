@@ -63,7 +63,7 @@ _inside(path, dir) = startswith(_real(path), rstrip(_real(dir), '/') * "/")
 # The study is the active environment's directory when the config lies inside it (a study that
 # carries its own Project.toml, so that a repository of many studies does not capture them all),
 # and otherwise the config's repository, or its directory outside git.
-function _source_roots(vault::Vault; depot::Bool=false)
+function _source_roots(vault::Vault; depot::Bool=false, notes=String[])
     cfg = dirname(abspath(vault.config_path))
     top = _git_read(cfg, "rev-parse", "--show-toplevel")
     project = Base.active_project()
@@ -88,14 +88,14 @@ function _source_roots(vault::Vault; depot::Bool=false)
             ),
         )
     end
-    depot && append!(roots, _depot_roots(roots))
+    depot && append!(roots, _depot_roots(roots, notes))
     return roots
 end
 
 # Every package this process loaded from a depot (`packages/<name>/<slug>`), with the tree hash the
 # active Manifest pins it to. These are what a registered or git-URL dependency is: a tree that
 # only a registry, a package server or a git remote can give back, so the snapshot keeps it.
-function _depot_roots(existing)
+function _depot_roots(existing, notes=String[])
     manifest = _active_manifest()
     manifest === nothing && return Any[]
     pinned = Dict{String,String}()
@@ -117,14 +117,16 @@ function _depot_roots(existing)
         any(r -> _real(r.dir) == _real(dir) || _inside(dir, r.dir), existing) && continue
         push!(out, (name="pkg:$(id.name):$(id.uuid)", dir=dir, kind=:depot, tree=tree))
     end
-    append!(out, _artifact_roots(out))
+    append!(out, _artifact_roots(out, notes))
     return sort!(out; by=r -> r.name)
 end
 
 # The artifacts those packages' `Artifacts.toml` select for this platform, where installed: a JLL
 # loads a library from `artifacts/<tree>`, which no package tree holds. Named by their tree hash,
 # which is also their directory's name, so a restore knows where each goes and what it must hash to.
-function _artifact_roots(packages)
+# One that cannot be resolved is a note, and the inventory is then not complete: a recomputation
+# would find the library missing, and the observation must not look whole.
+function _artifact_roots(packages, notes=String[])
     out = Any[]
     seen = Set{String}()
     platform = Base.BinaryPlatforms.HostPlatform()
@@ -133,13 +135,21 @@ function _artifact_roots(packages)
         isfile(toml) || continue
         dict = try
             TOML.parsefile(toml)
-        catch
+        catch e
+            push!(
+                notes,
+                "$(p.name): Artifacts.toml could not be resolved: $(sprint(showerror, e))",
+            )
             continue
         end
         for name in sort!(collect(keys(dict)))
             meta = try
                 Artifacts.artifact_meta(name, dict, toml; platform)
-            catch
+            catch e
+                push!(
+                    notes,
+                    "$(p.name): artifact $name could not be resolved: $(sprint(showerror, e))",
+                )
                 nothing
             end
             (meta === nothing || !haskey(meta, "git-tree-sha1")) && continue
@@ -530,7 +540,11 @@ as a worker id), which snapshot (`source`), each root's git HEAD and whether it 
 build (with the binary's digest, the platform and BLAS's thread count) and a fixed list of
 environment variables, and the **binding**: how far the code this process has loaded was checked
 against the snapshot (see [`binding_of`](@ref)). File contents are stored for `.jl` and `.toml`
-files and for any file up to `materialize_limit`; every file is inventoried by size and digest.
+files and for any other file up to `materialize_limit`, and for every file of a `depot` or
+`artifact` root up to `hash_limit` (a library there is routinely larger); a symlink's target is kept
+as its content. Every file is inventoried by size, and by digest up to `hash_limit`. An artifact
+that cannot be resolved, like a root that cannot be listed, is a note and leaves the inventory
+incomplete.
 
 Depot packages are kept at `run-start` only by default: that is the process that computed, and a
 render's plotting stack is large and not what a recomputation needs.
@@ -545,13 +559,15 @@ function observe_sources(
 )::String
     _refuse_if_readonly(vault, "observe_sources")
     observed_at = _utc_stamp()
-    roots = _source_roots(vault; depot=depot_packages)
+    root_notes = String[]
+    roots = _source_roots(vault; depot=depot_packages, notes=root_notes)
     entries, blobs, notes = _inventory(
         roots; hash_limit, materialize_limit, exclude=vault.outdir
     )
+    notes = vcat(root_notes, notes)
     complete =
         !any(e -> e.sha256 == "skipped" || e.type == "dir", entries) &&
-        !any(n -> occursin("could not be listed", n), notes)
+        !any(n -> occursin(r"could not be (listed|resolved)", n), notes)
     state = Dict{String,Any}(
         "recipe" => SOURCE_RECIPE,
         "roots" => [

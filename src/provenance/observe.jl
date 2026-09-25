@@ -148,7 +148,7 @@ function _artifact_roots(packages)
             dir = nothing
             for d in DEPOT_PATH
                 cand = joinpath(d, "artifacts", tree)
-                isdir(cand) && (dir = cand; break)
+                isdir(cand) && (dir=cand; break)
             end
             dir === nothing && continue                        # lazy and never fetched
             push!(seen, tree)

@@ -1,2 +1,4 @@
 docs/build/
 Manifest.toml
+# Julia coverage output (--code-coverage=user writes <file>.<pid>.cov beside each source)
+*.cov

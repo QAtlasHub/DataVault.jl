@@ -176,6 +176,8 @@ hostname      = "ohtaka"
 | `acquire_running!(vault, key[, owner])` | POSIX `link()` による排他取得。`owner` を渡すと `.running` に刻む |
 | `refresh_running!(vault, key[, owner])` / `clear_running!(vault, key[, owner])` | `owner` 付きは所有者が一致しない限り書かない・消さない |
 | `new_owner_token()` / `running_owner(vault, key)` | 取得を識別するトークンの生成と読み出し |
+| `start_heartbeat(vault, key, owner; interval)` / `stop_heartbeat(h)` | 子プロセスで heartbeat を打ち続ける（計算が yield しなくても止まらない） |
+| `mark_done!(vault, key, owner; …) -> Bool` | 自分のロックのときだけ `.done` を書く。reclaim された側は `false` で何も書かない |
 | `build_ledger(vault)` | `.done` を集約して `ledger.csv` を生成 |
 | `record_figure(vault; study, scripts)` | figure provenance の `meta.toml` を出力 |
 | `cleanup_stale(vault)` | 残存した `.running` を一掃 |
@@ -243,8 +245,38 @@ DataVault.refresh_running!(vault, key, tok) || return   # 負けたら止まる
 DataVault.clear_running!(vault, key, tok)               # 自分のものだけ消す
 ```
 
-2引数の形は従来どおり残してある。owner 検査は read-then-write なので、その隙間での reclaim までは
-閉じない。閉じるのは「reclaim が **すでに起きている**」場合、つまりキーの残り時間ずっと続く方。
+2引数の形は従来どおり残してある。
+
+#### ロックの規約（0.8.9）— 実測した穴と、その塞ぎ方
+
+| 穴（0.8.8 まで） | 実測 | 0.8.9 |
+|---|---|---|
+| `heartbeat=` がゾーン無しのローカル時刻 | New York で書いた 6 秒前のロックを Tokyo で 46806 秒前と読み、生きている保持者から奪った | 年齢は `heartbeat_unix=`（epoch 秒）から読む |
+| `heartbeat=` が秒単位 | 最大 1 秒古く読める。`stale_after=0.6` では書いた直後に reclaim された | 同上（μs 精度） |
+| reclaim が check → `rm` → `link` | ローカルディスクで 300 回に 1 回、2 人とも勝った | `<lock>.reclaim` で reclaim を直列化し、消す前に脇へ `rename` して中身を照合 |
+| heartbeat が保持者内の task | yield しない計算の間、`-t 1` / `-t 2` / `-t 2,1` いずれも 1 度も打たず、生きている保持者のキーが奪われ、奪われた側もそのまま commit した | `start_heartbeat` が子プロセスで打つ。`mark_done!(…, owner)` は負けた側を拒否する |
+
+ファイルの先頭 2 行（`heartbeat_unix=` と `heartbeat=`）は固定幅で、heartbeat はロックの inode に
+開いた記述子を通して **その場で** 書き換える。パス経由で書き直す（tmp を `mv`）と、直前に奪われた
+ロックの上に書いてしまうため。`heartbeat=` は旧 reader のために書き続けるので、古い DataVault と
+混在しても読める。
+
+```julia
+tok = DataVault.new_owner_token()
+DataVault.acquire_running!(vault, key, tok; stale_after=600.0) === :busy && return
+hb = DataVault.start_heartbeat(vault, key, tok; interval=60.0)
+result = try
+    compute(key)
+finally
+    DataVault.stop_heartbeat(hb)
+end
+DataVault.running_owner(vault, key) == tok || return            # 奪われていたら保存もしない
+saved = DataVault.save!(vault, key, result)
+DataVault.mark_done!(vault, key, tok; result=saved) || return   # 最後の隙間もここで拒否
+```
+
+子プロセスは親の pid が生きている間だけ打つので、デッドロックして生きている保持者はキーを持ち続ける
+（wall clock で kill されれば止まる）。Windows では `sh` が無いので打たず、`stale_after` で失効する。
 
 ### 中間成果物 (artifact) — セル間で共有し、一度だけ作る
 

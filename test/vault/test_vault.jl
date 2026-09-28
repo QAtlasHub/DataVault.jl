@@ -326,20 +326,33 @@ end
     end
 end
 
+# Rewrite both heartbeat lines of a lock `secs` into the past.
+function _backdate_heartbeat!(path, secs)
+    t = time() - secs
+    old_str = Dates.format(Dates.now() - Dates.Second(secs), "yyyy-mm-ddTHH:MM:SS")
+    lines = readlines(path)
+    open(path, "w") do io
+        for line in lines
+            if startswith(line, "heartbeat_unix=")
+                println(io, "heartbeat_unix=", DataVault.@sprintf("%017.6f", t))
+            elseif startswith(line, "heartbeat=")
+                println(io, "heartbeat=", old_str)
+            else
+                println(io, line)
+            end
+        end
+    end
+end
+
 @testset "acquire_running!: :reclaimed when heartbeat is stale" begin
     with_vault() do vault, _
         k = DataVault.keys(vault)[1]
         @test acquire_running!(vault, k) === :ok
 
-        # Backdate the heartbeat= line to simulate a crashed holder.
+        # Backdate the heartbeat to simulate a crashed holder: both lines, as a holder that stopped
+        # beating leaves them. Age is read from heartbeat_unix= (0.8.9), heartbeat= by old readers.
         path = DataVault._running_file(vault, k)
-        old_str = Dates.format(Dates.now() - Dates.Second(7200), "yyyy-mm-ddTHH:MM:SS")
-        lines = readlines(path)
-        open(path, "w") do io
-            for line in lines
-                println(io, startswith(line, "heartbeat=") ? "heartbeat=$old_str" : line)
-            end
-        end
+        _backdate_heartbeat!(path, 7200)
         @test running_age_secs(vault, k) > 600
 
         # stale_after=600: the old lock is stale, we should reclaim it.
@@ -368,13 +381,7 @@ end
         # Seed a very stale .running.
         acquire_running!(vault, k)
         path = DataVault._running_file(vault, k)
-        old_str = Dates.format(Dates.now() - Dates.Second(7200), "yyyy-mm-ddTHH:MM:SS")
-        lines = readlines(path)
-        open(path, "w") do io
-            for line in lines
-                println(io, startswith(line, "heartbeat=") ? "heartbeat=$old_str" : line)
-            end
-        end
+        _backdate_heartbeat!(path, 7200)
 
         # Fire 8 concurrent reclaim attempts; at most one may win.
         tasks = [@async acquire_running!(vault, k; stale_after=600.0) for _ in 1:8]

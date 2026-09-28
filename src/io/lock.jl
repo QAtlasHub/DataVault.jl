@@ -275,6 +275,10 @@ function _release_lock_at!(path::AbstractString, owner::AbstractString)::Bool
     return true
 end
 
+# The name this had before 0.8.9. Internal, but SweepRunner's tests release a held artifact lock
+# with it, and a missing name there fails as a 600 s wait rather than as an error.
+const _clear_lock_at! = _release_lock_at!
+
 # ── the heartbeat child ──────────────────────────────────────────────────────────────────────────
 #
 # Opens the lock ONCE, checks the owner on that descriptor, and from then on rewrites the fixed-

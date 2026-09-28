@@ -60,7 +60,20 @@ function mark_done!(
     _refuse_if_readonly(vault, "mark_done!")
     done = _done_file(vault, key)
     mkpath(dirname(done))
+    write(done, _done_body(vault; jobid, tag_value, result, observation))
 
+    running = _running_file(vault, key)
+    isfile(running) && rm(running; force=true)
+    return nothing
+end
+
+# The `.done` marker's content. Built BEFORE the owner form takes its lock out of circulation, so
+# the moment the key carries neither lock nor marker is two renames long rather than the git calls
+# this makes: with those in the gap, a sibling master started the key again (in-process masters on
+# one vault, 2 of 6 keys computed twice).
+function _done_body(
+    vault::Vault; jobid=nothing, tag_value=nothing, result=nothing, observation=nothing
+)
     jobid_str = if jobid !== nothing
         string(jobid)
     elseif haskey(ENV, "SLURM_JOB_ID")
@@ -93,12 +106,7 @@ function mark_done!(
         "observation=$(observation === nothing ? "unknown" : observation)",
     ]
     tag_value !== nothing && push!(lines, "tag_value=$tag_value")
-
-    write(done, join(lines, "\n") * "\n")
-
-    running = _running_file(vault, key)
-    isfile(running) && rm(running; force=true)
-    return nothing
+    return join(lines, "\n") * "\n"
 end
 
 """
@@ -113,21 +121,26 @@ stalled past `stale_after` and lost its key to a reclaim would then delete the r
 lock and put its own result in the marker; here it gets `false`, nothing is written, and the
 reclaimer's lock is untouched.
 
-The lock is moved aside (a `rename`) before the marker is written, and what moved is checked to be
-`owner`'s; a reclaim landing between the owner check and the move is put back. For the moment
-between the move and the marker the key carries neither, so a sibling can start it again: work is
-duplicated, never committed twice by a loser.
+The marker is written to a temporary file first. Then the lock is moved aside (a `rename`) and
+what moved is checked to be `owner`'s — a reclaim landing between the owner check and the move is
+put back — and the marker is renamed into place. The key carries neither lock nor marker only
+between those two renames, and a sibling that acquires in that gap still finds the marker when it
+re-checks `is_done` after acquiring.
 """
 function mark_done!(vault::Vault, key::DataKey, owner::AbstractString; kwargs...)::Bool
     _refuse_if_readonly(vault, "mark_done!")
-    aside = _take_own_lock_aside!(_running_file(vault, key), owner)
-    aside === nothing && return false
+    done = _done_file(vault, key)
+    mkpath(dirname(done))
+    tmp = _write_unique(done, "tmp", _done_body(vault; kwargs...))
     try
-        mark_done!(vault, key; kwargs...)
-    finally
+        aside = _take_own_lock_aside!(_running_file(vault, key), owner)
+        aside === nothing && return false
+        Base.rename(tmp, done)
         rm(aside; force=true)
+        return true
+    finally
+        rm(tmp; force=true)
     end
-    return true
 end
 
 """

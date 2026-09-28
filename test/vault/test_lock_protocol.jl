@@ -176,6 +176,35 @@ end
     end
 end
 
+@testset "lock: masters racing over one vault compute each key once" begin
+    # The owner-checked commit took its lock out of circulation and THEN built the marker (git
+    # calls, tens of ms); a master arriving in that gap found neither and computed the key again.
+    # The loop is what a master does: skip done keys, acquire, re-check, compute, commit.
+    for masters in (2, 4, 8)
+        with_lp() do v, _
+            keys = DataVault.keys(v)
+            calls = Dict(canonical(k) => Threads.Atomic{Int}(0) for k in keys)
+            refused = Threads.Atomic{Int}(0)
+            master = () -> for k in keys
+                is_done(v, k) && continue
+                tok = new_owner_token()
+                acquire_running!(v, k, tok) === :busy && continue
+                if is_done(v, k)
+                    clear_running!(v, k, tok)
+                    continue
+                end
+                Threads.atomic_add!(calls[canonical(k)], 1)
+                sleep(0.01)
+                mark_done!(v, k, tok) || Threads.atomic_add!(refused, 1)
+            end
+            foreach(wait, [Threads.@spawn(master()) for _ in 1:masters])
+            @test all(k -> is_done(v, k), keys)
+            @test all(c -> c[] == 1, values(calls))
+            @test refused[] == 0
+        end
+    end
+end
+
 @testset "lock: a holder whose work never yields keeps its key (heartbeat child)" begin
     # A heartbeat TASK did not move once during a busy loop, with -t 1, -t 2 and -t 2,1, and the
     # key was taken from a live holder, which then committed it as well. Sweep -t; the child must

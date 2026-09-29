@@ -115,8 +115,9 @@ its directory — the same lock and reclaim rule as [`acquire_running!`](@ref). 
 lock, and the error propagates.
 
 **Heartbeat.** While `build` runs, a small `sh` child process rewrites the lock's heartbeat
-every `heartbeat_interval` seconds for as long as this process is alive (`kill -0`), and a
-sibling reclaims the lock after `stale_after` seconds without one. It is a separate PROCESS on
+every `heartbeat_interval` seconds for as long as this process is alive (`kill -0`) and the
+lock's name still points at the file it opened (it stops once the lock is released or
+reclaimed), and a sibling reclaims the lock after `stale_after` seconds without one. It is a separate PROCESS on
 purpose: a task inside Julia does not run while a build computes without yielding — measured,
 a `sleep`-driven task on an interactive thread (`julia -t 1,1`) ticked 0 times in 3 s of a busy
 main thread. So `stale_after` bounds how long a crashed or walltime-killed builder blocks the

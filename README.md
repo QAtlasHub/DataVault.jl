@@ -176,8 +176,8 @@ hostname      = "ohtaka"
 | `acquire_running!(vault, key[, owner])` | POSIX `link()` による排他取得。`owner` を渡すと `.running` に刻む |
 | `refresh_running!(vault, key[, owner])` / `clear_running!(vault, key[, owner])` | `owner` 付きは所有者が一致しない限り書かない・消さない |
 | `new_owner_token()` / `running_owner(vault, key)` | 取得を識別するトークンの生成と読み出し |
-| `start_heartbeat(vault, key, owner; interval)` / `stop_heartbeat(h)` | 子プロセスで heartbeat を打ち続ける（計算が yield しなくても止まらない） |
-| `mark_done!(vault, key, owner; …) -> Bool` | 自分のロックのときだけ `.done` を書く。reclaim された側は `false` で何も書かない |
+| `start_heartbeat(vault, key, owner; interval)` / `stop_heartbeat(h)` / `heartbeat_alive(h)` | 子プロセスで heartbeat を打ち続ける（計算が yield しなくても止まらない）。止まっていれば `heartbeat_alive` が `false`、保持中に止まっていたら `stop_heartbeat` が警告する |
+| `mark_done!(vault, key, owner; …) -> Bool` | 自分のロックのときだけ `.done` を書く。reclaim された側は `false` で何も書かない。3 番目が owner token の形（`host:pid:nonce`）でなければ `ArgumentError` |
 | `build_ledger(vault)` | `.done` を集約して `ledger.csv` を生成 |
 | `record_figure(vault; study, scripts)` | figure provenance の `meta.toml` を出力 |
 | `cleanup_stale(vault)` | 残存した `.running` を一掃 |
@@ -276,7 +276,16 @@ DataVault.mark_done!(vault, key, tok; result=saved) || return   # 最後の隙�
 ```
 
 子プロセスは親の pid が生きている間だけ打つので、デッドロックして生きている保持者はキーを持ち続ける
-（wall clock で kill されれば止まる）。Windows では `sh` が無いので打たず、`stale_after` で失効する。
+（wall clock で kill されれば止まる）。ロックが解放・reclaim されると 0.5 秒の再確認のあと止まる
+（reclaim 側が一瞬だけロックを脇へ移して戻す間は止まらない）。
+
+子プロセスは **Linux 専用**: `/dev/fd/3` を開き直して先頭に書くが、macOS / BSD の `fdescfs` は
+記述子のオフセットを共有するので先頭に書けない。それ以外の OS と、0.8.8 以前の DataVault が書いた
+ロック（固定幅ヘッダが無い）では heartbeat は task で打つ（yield している間だけ打てる）。
+`interval <= 0` は何も打たないハンドルを返し、ロックは `stale_after` で失効する。
+
+プロセスがロック操作の途中で殺されると `<lock>.acq.<pid>.<hex>` などの一時ファイルが残る。reclaim の
+たびに同じディレクトリの 1 分以上古いものを消し、`cleanup_stale` も消す。
 
 ### 中間成果物 (artifact) — セル間で共有し、一度だけ作る
 

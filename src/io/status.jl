@@ -129,6 +129,15 @@ re-checks `is_done` after acquiring.
 """
 function mark_done!(vault::Vault, key::DataKey, owner::AbstractString; kwargs...)::Bool
     _refuse_if_readonly(vault, "mark_done!")
+    # Before this method existed a third positional argument was a MethodError. A job id or a tag
+    # passed there by mistake would now be an owner that never matches, and the commit a silent
+    # `false`; a token always has the `host:pid:nonce` shape, so anything else is refused loudly.
+    count(==(':'), owner) >= 2 || throw(
+        ArgumentError(
+            "mark_done!: the third argument is an owner token (`host:pid:nonce`, from " *
+            "new_owner_token), got $(repr(owner)). jobid and tag_value are keywords.",
+        ),
+    )
     done = _done_file(vault, key)
     mkpath(dirname(done))
     tmp = _write_unique(done, "tmp", _done_body(vault; kwargs...))
@@ -146,8 +155,8 @@ end
 """
     mark_running!(vault, key)
 
-Write a `.running` sentinel with `pid`, `started`, and `heartbeat`
-fields.  **Non-atomic overwrite** — for multi-master coordination use
+Write a `.running` sentinel with `heartbeat_unix`, `heartbeat`, `pid` and
+`started` fields.  **Non-atomic overwrite** — for multi-master coordination use
 [`acquire_running!`](@ref) instead, which guarantees exclusive
 acquisition via POSIX `link()`.
 """
@@ -234,20 +243,12 @@ The `owner=` token in the `.running` file, or `nothing` when the file is absent 
 token. A `.running` written before owner stamping, or by [`mark_running!`](@ref), has none.
 """
 function running_owner(vault::Vault, key::DataKey)::Union{String,Nothing}
-    lines = _running_lines(vault, key)
-    lines === nothing && return nothing
-    i = findfirst(l -> startswith(l, "owner="), lines)
-    return i === nothing ? nothing : String(lines[i][7:end])
-end
-
-# The `.running` file's lines, or `nothing` when it cannot be read. Absent and unreadable are one
-# outcome on purpose: an owner-aware verb can prove ownership from neither.
-function _running_lines(vault::Vault, key::DataKey)::Union{Vector{String},Nothing}
-    try
-        return readlines(_running_file(vault, key))
-    catch
-        return nothing
+    content = _read_lock(_running_file(vault, key))
+    content === nothing && return nothing
+    for line in eachsplit(content, '\n')
+        startswith(line, "owner=") && return String(line[7:end])
     end
+    return nothing
 end
 
 """
@@ -269,7 +270,8 @@ end
 """
     touch_running!(vault, key)
 
-Update the `heartbeat=` line in the `.running` file to the current time.
+Update the heartbeat (`heartbeat_unix=` and `heartbeat=`) in the `.running` file to the current
+time.
 Called periodically (e.g. every 60 s) while computation is in progress so
 that [`cleanup_stale`](@ref) can distinguish live jobs from crashed ones.
 
@@ -290,8 +292,7 @@ underneath us — meaning another master has reclaimed via
 [`acquire_running!`](@ref) after `stale_after` elapsed, and the caller
 should stop work.
 
-Thin wrapper around [`touch_running!`](@ref) that also tells the caller
-whether the heartbeat update actually landed.
+The same heartbeat as [`touch_running!`](@ref), and whether it landed.
 """
 function refresh_running!(vault::Vault, key::DataKey)::Bool
     _refuse_if_readonly(vault, "refresh_running!")
@@ -337,7 +338,13 @@ inode it opened, then rewrites the heartbeat header in place.
 
 It does not tell the holder that the lock was lost; check with [`running_owner`](@ref) before
 committing, and commit with the owner form of [`mark_done!`](@ref), which refuses a lost key.
-Not available on Windows (no `sh`): the handle is inert and the lock ages out after `stale_after`.
+[`heartbeat_alive`](@ref) says whether it is still beating, and [`stop_heartbeat`](@ref) warns if
+it stopped while the lock was still held.
+
+The child needs Linux: it rewrites the header through `/dev/fd`, which re-opens the file there
+with its own offset, and BSD / macOS share the descriptor's instead. Elsewhere — and for a lock
+written by a DataVault older than 0.8.9 — the heartbeat is a task, which beats only while the
+holder yields. `interval <= 0` gives an inert handle, and the lock ages out after `stale_after`.
 """
 function start_heartbeat(
     vault::Vault, key::DataKey, owner::AbstractString; interval::Real=60.0
@@ -366,17 +373,8 @@ Read the `heartbeat=` timestamp from the `.running` file. Returns `nothing`
 if the file does not exist or the timestamp cannot be parsed.
 """
 function running_heartbeat(vault::Vault, key::DataKey)::Union{DateTime,Nothing}
-    path = _running_file(vault, key)
-    isfile(path) || return nothing
-    try
-        for line in eachline(path)
-            if startswith(line, "heartbeat=")
-                return Dates.DateTime(line[11:end], "yyyy-mm-ddTHH:MM:SS")
-            end
-        end
-    catch
-    end
-    return nothing
+    content = _read_lock(_running_file(vault, key))
+    return content === nothing ? nothing : _heartbeat_local(content)
 end
 
 """

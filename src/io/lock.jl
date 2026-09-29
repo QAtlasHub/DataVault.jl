@@ -278,11 +278,10 @@ function _beat_lock_at!(path::AbstractString, owner::Union{AbstractString,Nothin
         else
             # Written before the header existed: its `heartbeat=` line is fixed width too, so it is
             # rewritten where it stands. The lock keeps its format; readers read it as before.
-            r = findfirst(
-                r"(?:^|\n)heartbeat=\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d(?:\n|$)", content
-            )
-            r === nothing && return false
-            at = content[first(r)] == '\n' ? first(r) : first(r) - 1
+            # Found by walking the lines, not by one regex: `(?:^|\n)heartbeat=…(?:\n|$)` matched
+            # on Julia 1.12 and found nothing on 1.13, and the lock silently stopped being beaten.
+            at = _legacy_heartbeat_offset(content)
+            at === nothing && return false
             seek(io, at)
             write(io, "heartbeat=" * Libc.strftime(_LOCAL_FMT, t))
         end
@@ -293,6 +292,20 @@ function _beat_lock_at!(path::AbstractString, owner::Union{AbstractString,Nothin
     finally
         close(io)
     end
+end
+
+# The byte offset of a well-formed `heartbeat=yyyy-mm-ddTHH:MM:SS` line, or `nothing`.
+function _legacy_heartbeat_offset(content::AbstractString)::Union{Int,Nothing}
+    off = 0
+    for line in eachsplit(content, '\n')
+        if startswith(line, "heartbeat=") &&
+            ncodeunits(line) == 29 &&
+            tryparse(DateTime, line[11:end], dateformat"yyyy-mm-ddTHH:MM:SS") !== nothing
+            return off
+        end
+        off += ncodeunits(line) + 1
+    end
+    return nothing
 end
 
 function _same_inode(io::IO, path::AbstractString)::Bool

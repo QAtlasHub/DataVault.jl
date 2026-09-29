@@ -44,7 +44,7 @@ end
         for ahead in (Dates.Second(60), Dates.Hour(10))   # within-skew and beyond-skew
             future = Dates.now() + ahead
             write(p, "heartbeat=" * Dates.format(future, "yyyy-mm-ddTHH:MM:SS") * "\n")
-            @test DataVault._running_age_secs(p, Dates.now()) >= 0.0
+            @test DataVault._running_age_secs(p) >= 0.0
         end
     end
 end

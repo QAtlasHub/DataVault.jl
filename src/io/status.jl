@@ -11,6 +11,9 @@
 #   (used on failure paths so the key is immediately retriable).
 # - [`cleanup_stale`](@ref) reaps any `.running` whose heartbeat is
 #   older than `stale_after`.
+# - [`start_heartbeat`](@ref) keeps a held lock fresh from a child process.
+#
+# The protocol itself (age, reclaim, in-place heartbeat) is in `io/lock.jl`.
 #
 # Downstream packages (e.g. `SweepRunner.jl`) should not maintain
 # a separate lock-file tree — `acquire_running!` IS the lock.
@@ -57,7 +60,20 @@ function mark_done!(
     _refuse_if_readonly(vault, "mark_done!")
     done = _done_file(vault, key)
     mkpath(dirname(done))
+    write(done, _done_body(vault; jobid, tag_value, result, observation))
 
+    running = _running_file(vault, key)
+    isfile(running) && rm(running; force=true)
+    return nothing
+end
+
+# The `.done` marker's content. Built BEFORE the owner form takes its lock out of circulation, so
+# the moment the key carries neither lock nor marker is two renames long rather than the git calls
+# this makes: with those in the gap, a sibling master started the key again (in-process masters on
+# one vault, 2 of 6 keys computed twice).
+function _done_body(
+    vault::Vault; jobid=nothing, tag_value=nothing, result=nothing, observation=nothing
+)
     jobid_str = if jobid !== nothing
         string(jobid)
     elseif haskey(ENV, "SLURM_JOB_ID")
@@ -90,19 +106,57 @@ function mark_done!(
         "observation=$(observation === nothing ? "unknown" : observation)",
     ]
     tag_value !== nothing && push!(lines, "tag_value=$tag_value")
+    return join(lines, "\n") * "\n"
+end
 
-    write(done, join(lines, "\n") * "\n")
+"""
+    mark_done!(vault, key, owner; jobid=nothing, tag_value=nothing, result=nothing,
+               observation=nothing) -> Bool
 
-    running = _running_file(vault, key)
-    isfile(running) && rm(running; force=true)
-    return nothing
+[`mark_done!`](@ref) for the holder of an owner-stamped lock: writes the `.done` marker only if
+the `.running` file is still `owner`'s, and returns whether it did.
+
+The two-argument form deletes whatever `.running` is there and commits regardless. A master that
+stalled past `stale_after` and lost its key to a reclaim would then delete the reclaimer's live
+lock and put its own result in the marker; here it gets `false`, nothing is written, and the
+reclaimer's lock is untouched.
+
+The marker is written to a temporary file first. Then the lock is moved aside (a `rename`) and
+what moved is checked to be `owner`'s — a reclaim landing between the owner check and the move is
+put back — and the marker is renamed into place. The key carries neither lock nor marker only
+between those two renames, and a sibling that acquires in that gap still finds the marker when it
+re-checks `is_done` after acquiring.
+"""
+function mark_done!(vault::Vault, key::DataKey, owner::AbstractString; kwargs...)::Bool
+    _refuse_if_readonly(vault, "mark_done!")
+    # Before this method existed a third positional argument was a MethodError. A job id or a tag
+    # passed there by mistake would now be an owner that never matches, and the commit a silent
+    # `false`; a token always has the `host:pid:nonce` shape, so anything else is refused loudly.
+    count(==(':'), owner) >= 2 || throw(
+        ArgumentError(
+            "mark_done!: the third argument is an owner token (`host:pid:nonce`, from " *
+            "new_owner_token), got $(repr(owner)). jobid and tag_value are keywords.",
+        ),
+    )
+    done = _done_file(vault, key)
+    mkpath(dirname(done))
+    tmp = _write_unique(done, "tmp", _done_body(vault; kwargs...))
+    try
+        aside = _take_own_lock_aside!(_running_file(vault, key), owner)
+        aside === nothing && return false
+        Base.rename(tmp, done)
+        rm(aside; force=true)
+        return true
+    finally
+        rm(tmp; force=true)
+    end
 end
 
 """
     mark_running!(vault, key)
 
-Write a `.running` sentinel with `pid`, `started`, and `heartbeat`
-fields.  **Non-atomic overwrite** — for multi-master coordination use
+Write a `.running` sentinel with `heartbeat_unix`, `heartbeat`, `pid` and
+`started` fields.  **Non-atomic overwrite** — for multi-master coordination use
 [`acquire_running!`](@ref) instead, which guarantees exclusive
 acquisition via POSIX `link()`.
 """
@@ -110,8 +164,7 @@ function mark_running!(vault::Vault, key::DataKey)
     _refuse_if_readonly(vault, "mark_running!")
     path = _running_file(vault, key)
     mkpath(dirname(path))
-    now_str = Dates.format(Dates.now(), "yyyy-mm-ddTHH:MM:SS")
-    write(path, "pid=$(getpid())\nstarted=$(now_str)\nheartbeat=$(now_str)\n")
+    write(path, _lock_body(""))
     return nothing
 end
 
@@ -142,9 +195,17 @@ if the target already exists.  `link` is atomic on local filesystems
 and on NFSv3/v4 per `man 2 link`, so two concurrent `acquire_running!`
 calls on different hosts cannot both return `:ok`.
 
-Stale-reclaim is best-effort (the `rm()` before `link()` is racy with
-other reclaimers), but the final `link()` call still serialises: at
-most one caller sees `:ok` / `:reclaimed`; the rest see `:busy`.
+A stale lock is reclaimed under a second link-lock (`.running.reclaim`),
+so reclaimers take turns, and the stale file is moved aside and compared
+with what was judged stale before it is removed: a holder that beat in the
+meantime keeps its lock. At most one caller sees `:ok` / `:reclaimed`.
+
+# Age
+
+A lock's age is read from `heartbeat_unix=` (seconds since the epoch, so the
+writer's and reader's time zones do not enter). A lock written by an older
+DataVault has only `heartbeat=` (local time, whole seconds) and is read as
+before.
 
 # Companion API
 
@@ -182,20 +243,12 @@ The `owner=` token in the `.running` file, or `nothing` when the file is absent 
 token. A `.running` written before owner stamping, or by [`mark_running!`](@ref), has none.
 """
 function running_owner(vault::Vault, key::DataKey)::Union{String,Nothing}
-    lines = _running_lines(vault, key)
-    lines === nothing && return nothing
-    i = findfirst(l -> startswith(l, "owner="), lines)
-    return i === nothing ? nothing : String(lines[i][7:end])
-end
-
-# The `.running` file's lines, or `nothing` when it cannot be read. Absent and unreadable are one
-# outcome on purpose: an owner-aware verb can prove ownership from neither.
-function _running_lines(vault::Vault, key::DataKey)::Union{Vector{String},Nothing}
-    try
-        return readlines(_running_file(vault, key))
-    catch
-        return nothing
+    content = _read_lock(_running_file(vault, key))
+    content === nothing && return nothing
+    for line in eachsplit(content, '\n')
+        startswith(line, "owner=") && return String(line[7:end])
     end
+    return nothing
 end
 
 """
@@ -214,54 +267,11 @@ function acquire_running!(
     return _acquire_lock_at!(_running_file(vault, key), owner; stale_after=stale_after)
 end
 
-# The lock itself, on a path rather than a key, so that anything with a directory — a sweep
-# key's status dir, an artifact's dir — takes the same `link()` lock and the same reclaim rule.
-function _acquire_lock_at!(
-    path::AbstractString, owner::AbstractString; stale_after::Real=600.0
-)::Symbol
-    mkpath(dirname(path))
-
-    reclaimed = false
-    if isfile(path)
-        age = _running_age_secs(path, Dates.now())
-        if age <= Float64(stale_after)
-            return :busy
-        end
-        # Stale — attempt reclaim.  The `rm` is racy against concurrent
-        # reclaimers, but the `link()` below is the final serialiser.
-        try
-            rm(path; force=true)
-            reclaimed = true
-        catch
-            return :busy
-        end
-    end
-
-    # Write fresh content to a unique tmp name, then `link()` it into
-    # place.  `link()` fails atomically if the target already exists.
-    now_str = Dates.format(Dates.now(), "yyyy-mm-ddTHH:MM:SS")
-    tmp_name = @sprintf("%s.acq.%d.%x", basename(path), getpid(), rand(UInt32))
-    tmp = joinpath(dirname(path), tmp_name)
-    body = "pid=$(getpid())\nstarted=$(now_str)\nheartbeat=$(now_str)\n"
-    isempty(owner) || (body *= "owner=$(owner)\n")
-    write(tmp, body)
-
-    linked = try
-        ccall(:link, Cint, (Cstring, Cstring), tmp, path) == 0
-    catch
-        false
-    end
-    # Always unlink the tmp path.  On success, the inode stays alive
-    # through the `path` hardlink; on failure, the tmp file is purged.
-    rm(tmp; force=true)
-
-    return linked ? (reclaimed ? :reclaimed : :ok) : :busy
-end
-
 """
     touch_running!(vault, key)
 
-Update the `heartbeat=` line in the `.running` file to the current time.
+Update the heartbeat (`heartbeat_unix=` and `heartbeat=`) in the `.running` file to the current
+time.
 Called periodically (e.g. every 60 s) while computation is in progress so
 that [`cleanup_stale`](@ref) can distinguish live jobs from crashed ones.
 
@@ -269,23 +279,7 @@ No-op if the `.running` file does not exist (already cleared or never created).
 """
 function touch_running!(vault::Vault, key::DataKey)
     _refuse_if_readonly(vault, "touch_running!")
-    path = _running_file(vault, key)
-    isfile(path) || return nothing
-    now_str = Dates.format(Dates.now(), "yyyy-mm-ddTHH:MM:SS")
-    try
-        lines = readlines(path)
-        open(path, "w") do io
-            for line in lines
-                if startswith(line, "heartbeat=")
-                    println(io, "heartbeat=$(now_str)")
-                else
-                    println(io, line)
-                end
-            end
-        end
-    catch
-        # .running may have been removed by another master; swallow
-    end
+    _beat_lock_at!(_running_file(vault, key), nothing)
     return nothing
 end
 
@@ -298,15 +292,12 @@ underneath us — meaning another master has reclaimed via
 [`acquire_running!`](@ref) after `stale_after` elapsed, and the caller
 should stop work.
 
-Thin wrapper around [`touch_running!`](@ref) that also tells the caller
-whether the heartbeat update actually landed.
+The same heartbeat as [`touch_running!`](@ref), and whether it landed.
 """
 function refresh_running!(vault::Vault, key::DataKey)::Bool
     _refuse_if_readonly(vault, "refresh_running!")
     path = _running_file(vault, key)
-    isfile(path) || return false
-    touch_running!(vault, key)
-    return isfile(path)
+    return _beat_lock_at!(path, nothing)
 end
 
 """
@@ -320,37 +311,46 @@ reclaiming master's file.
 The owner-blind two-argument form cannot: it returns `false` only when the file is ABSENT, which is
 a window of microseconds during a reclaim.
 
-The check is read-then-write and not atomic. A sibling reclaiming in the gap between the two is
-still possible; what this closes is the case where a reclaim has ALREADY happened, which is the one
-that lasts for the rest of the key. A file that cannot be read at all is `false` as well: absent
-and unreadable are both "not provably ours".
+The heartbeat is written through a descriptor opened on the lock's inode, after the owner was read
+from that same descriptor and while the name still points at it. A reclaim landing after the check
+therefore writes to the inode it took out of circulation, never to the reclaimer's file. A file
+that cannot be read at all is `false` as well: absent and unreadable are both "not provably ours".
+
+A holder whose work may not yield for `stale_after` should not rely on calling this from a task:
+use [`start_heartbeat`](@ref).
 """
 function refresh_running!(vault::Vault, key::DataKey, owner::AbstractString)::Bool
     _refuse_if_readonly(vault, "refresh_running!")
-    return _refresh_lock_at!(_running_file(vault, key), owner)
+    return _beat_lock_at!(_running_file(vault, key), owner)
 end
 
-function _refresh_lock_at!(path::AbstractString, owner::AbstractString)::Bool
-    lines = _lock_lines(path)
-    lines === nothing && return false
-    any(l -> l == "owner=$(owner)", lines) || return false
+"""
+    start_heartbeat(vault, key, owner; interval=60.0) -> HeartbeatHandle
 
-    now_str = Dates.format(Dates.now(), "yyyy-mm-ddTHH:MM:SS")
-    open(path, "w") do io
-        for line in lines
-            println(io, startswith(line, "heartbeat=") ? "heartbeat=$(now_str)" : line)
-        end
-    end
-    return true
-end
+Keep `owner`'s `.running` lock fresh from a CHILD process until [`stop_heartbeat`](@ref), until
+this process exits, or until the lock is released or reclaimed, whichever is first.
 
-# A lock file's lines, or `nothing` when it cannot be read — absent and unreadable alike.
-function _lock_lines(path::AbstractString)::Union{Vector{String},Nothing}
-    try
-        return readlines(path)
-    catch
-        return nothing
-    end
+A heartbeat task inside the holder is starved by work that does not yield — a long BLAS call, a
+tight loop — whatever `-t` is: measured with `-t 1`, `-t 2` and `-t 2,1`, the heartbeat did not
+move for the whole of such a loop, and a live holder's key was reclaimed. The child is a small `sh`
+loop that checks the parent is alive (`kill -0`) and that the lock's name still points at the
+inode it opened, then rewrites the heartbeat header in place.
+
+It does not tell the holder that the lock was lost; check with [`running_owner`](@ref) before
+committing, and commit with the owner form of [`mark_done!`](@ref), which refuses a lost key.
+[`heartbeat_alive`](@ref) says whether it is still beating, and [`stop_heartbeat`](@ref) warns if
+it stopped while the lock was still held.
+
+The child needs Linux: it rewrites the header through `/dev/fd`, which re-opens the file there
+with its own offset, and BSD / macOS share the descriptor's instead. Elsewhere — and for a lock
+written by a DataVault older than 0.8.9 — the heartbeat is a task, which beats only while the
+holder yields. `interval <= 0` gives an inert handle, and the lock ages out after `stale_after`.
+"""
+function start_heartbeat(
+    vault::Vault, key::DataKey, owner::AbstractString; interval::Real=60.0
+)::HeartbeatHandle
+    _refuse_if_readonly(vault, "start_heartbeat")
+    return _start_lock_heartbeat(_running_file(vault, key), owner, interval)
 end
 
 """
@@ -362,8 +362,8 @@ internally by [`acquire_running!`](@ref) and [`cleanup_stale`](@ref).
 """
 function running_age_secs(vault::Vault, key::DataKey)::Float64
     path = _running_file(vault, key)
-    isfile(path) || return Inf
-    return _running_age_secs(path, Dates.now())
+    age = _lock_age(path)
+    return age === nothing ? Inf : age
 end
 
 """
@@ -373,17 +373,8 @@ Read the `heartbeat=` timestamp from the `.running` file. Returns `nothing`
 if the file does not exist or the timestamp cannot be parsed.
 """
 function running_heartbeat(vault::Vault, key::DataKey)::Union{DateTime,Nothing}
-    path = _running_file(vault, key)
-    isfile(path) || return nothing
-    try
-        for line in eachline(path)
-            if startswith(line, "heartbeat=")
-                return Dates.DateTime(line[11:end], "yyyy-mm-ddTHH:MM:SS")
-            end
-        end
-    catch
-    end
-    return nothing
+    content = _read_lock(_running_file(vault, key))
+    return content === nothing ? nothing : _heartbeat_local(content)
 end
 
 """
@@ -409,20 +400,12 @@ The two-argument form deletes regardless of owner, so a master releasing AFTER l
 deletes the reclaiming master's live `.running` and re-opens double execution. An unstamped file is
 not removed either: it cannot be shown to be ours, and `stale_after` will reclaim it.
 
-Read-then-unlink, so the same non-atomic gap as [`refresh_running!`](@ref) applies. The difference
-from the owner-blind form is unbounded-to-microseconds, not to zero.
+The file is moved aside (a `rename`) and what moved is checked to be `owner`'s before it is
+removed; a lock reclaimed between the owner check and the move is put back.
 """
 function clear_running!(vault::Vault, key::DataKey, owner::AbstractString)::Bool
     _refuse_if_readonly(vault, "clear_running!")
-    return _clear_lock_at!(_running_file(vault, key), owner)
-end
-
-function _clear_lock_at!(path::AbstractString, owner::AbstractString)::Bool
-    lines = _lock_lines(path)
-    lines === nothing && return false
-    any(l -> l == "owner=$(owner)", lines) || return false
-    rm(path; force=true)
-    return true
+    return _release_lock_at!(_running_file(vault, key), owner)
 end
 
 """

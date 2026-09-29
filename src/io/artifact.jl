@@ -114,9 +114,10 @@ its directory — the same lock and reclaim rule as [`acquire_running!`](@ref). 
 [`ArtifactBusy`](@ref) at once. A builder that throws leaves nothing behind and releases the
 lock, and the error propagates.
 
-**Heartbeat.** While `build` runs, a small `sh` child process rewrites the lock's `heartbeat=`
-every `heartbeat_interval` seconds for as long as this process is alive (`kill -0`), and a
-sibling reclaims the lock after `stale_after` seconds without one. It is a separate PROCESS on
+**Heartbeat.** While `build` runs, a small `sh` child process rewrites the lock's heartbeat
+every `heartbeat_interval` seconds for as long as this process is alive (`kill -0`) and the
+lock's name still points at the file it opened (it stops once the lock is released or
+reclaimed), and a sibling reclaims the lock after `stale_after` seconds without one. It is a separate PROCESS on
 purpose: a task inside Julia does not run while a build computes without yielding — measured,
 a `sleep`-driven task on an interactive thread (`julia -t 1,1`) ticked 0 times in 3 s of a busy
 main thread. So `stale_after` bounds how long a crashed or walltime-killed builder blocks the
@@ -166,7 +167,7 @@ function artifact!(
                     build, akey, vault, n, id, dir, file, lock, owner, heartbeat_interval
                 )
             finally
-                _clear_lock_at!(lock, owner)
+                _release_lock_at!(lock, owner)
             end
         end
 
@@ -189,11 +190,11 @@ end
 function _build_artifact!(
     build, akey, vault, name, id, dir, file, lock, owner, heartbeat_interval
 )
-    hb = _start_heartbeat(lock, owner, heartbeat_interval)
+    hb = _start_lock_heartbeat(lock, owner, heartbeat_interval)
     value = try
         build(akey)
     finally
-        _stop_heartbeat(hb)
+        stop_heartbeat(hb)
     end
 
     # `inputs.toml` first, so that when `artifact.jld2` appears — atomically, by `mv` — its
@@ -218,35 +219,3 @@ end
 _toml_safe(v::Union{Bool,Integer,AbstractFloat,AbstractString}) = v
 _toml_safe(v::AbstractVector) = [_toml_safe(x) for x in v]
 _toml_safe(v) = repr(v)
-
-# The heartbeat as a child process: refresh `heartbeat=` in `lock` every `interval` seconds while
-# the parent pid lives and the lock is still `owner`'s. Arguments go in as `$1..$4`, never
-# spliced into the script, so no path or token needs quoting. The rewrite goes through a temp file
-# and `mv`, so a reader never sees half a file.
-const _HEARTBEAT_SH = raw"""
-pid=$1; interval=$2; lock=$3; owner=$4
-while kill -0 "$pid" 2>/dev/null; do
-    sleep "$interval"
-    grep -qx "owner=$owner" "$lock" 2>/dev/null || exit 0
-    hb=$(date '+%Y-%m-%dT%H:%M:%S')
-    tmp="$lock.hb.$$"
-    awk -v hb="$hb" '/^heartbeat=/ { print "heartbeat=" hb; next } { print }' "$lock" > "$tmp" &&
-        mv -f "$tmp" "$lock"
-done
-"""
-
-function _start_heartbeat(lock::AbstractString, owner::AbstractString, interval::Real)
-    Sys.iswindows() && return nothing       # no `sh`: the lock then ages out after `stale_after`
-    cmd = `sh -c $_HEARTBEAT_SH sh $(getpid()) $(interval) $lock $owner`
-    return run(pipeline(cmd; stdout=devnull, stderr=devnull); wait=false)
-end
-
-function _stop_heartbeat(p)
-    p === nothing && return nothing
-    try
-        kill(p)
-        Base.wait(p)
-    catch
-    end
-    return nothing
-end

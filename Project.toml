@@ -1,6 +1,6 @@
 name = "DataVault"
 uuid = "23f5f8f6-b4da-40ee-8c72-c53b6c5de94f"
-version = "0.8.8"
+version = "0.8.9"
 authors = ["sota shimozono <shimozono-sota631@g.ecc.u-tokyo.ac.jp>"]
 
 [deps]
@@ -24,6 +24,7 @@ Aqua = "0.8"
 Artifacts = "1"
 CRC32c = "1.11"
 Dates = "1.11.0"
+Distributed = "1.11"
 JLD2 = "0.6.4"
 JSON3 = "1"
 LinearAlgebra = "1.11"
@@ -41,9 +42,10 @@ julia = "1.11"
 
 [extras]
 Aqua = "4c88cf16-eb10-579e-8560-4a9242c79595"
+Distributed = "8ba89e20-285c-5b6f-9357-94700520ee1b"
 Logging = "56ddb016-857b-54e1-b83d-db4d58db5568"
 Test = "8dfed614-e22c-5e08-85e1-65c5234f0b40"
 TestShards = "acceef1d-f5e0-4fe4-a546-818dc56ce7b2"
 
 [targets]
-test = ["Aqua", "Logging", "Test", "TestShards"]
+test = ["Aqua", "Distributed", "Logging", "Test", "TestShards"]

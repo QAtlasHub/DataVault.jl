@@ -45,9 +45,17 @@ maps a `DataKey` to file storage and tracks what's done. project-agnostic. See
   trace; `Base._included_files` records no run-time include), so `loaded-matches-disk` is never
   written; an old record's is read as `unverified`. Nothing under `.datavault/` may be
   named `*.log.toml`: discovery walks the tree for that suffix.
+- **The lock protocol lives in `src/io/lock.jl`** and every rule in it was a measured hole: age
+  from `heartbeat_unix=` (epoch; the zone-less whole-second `heartbeat=` is still written for old
+  readers), a fixed-width header rewritten IN PLACE through a descriptor on the lock's inode (never
+  by path), reclaim serialised by `<lock>.reclaim` and checked by moving the stale file aside, and
+  the heartbeat in a CHILD process (`start_heartbeat`) because an in-process task is starved by
+  work that does not yield. `test/vault/test_lock_protocol.jl` sweeps each; a change that loosens
+  one must first show that sweep still passing against the old defect.
 - **`.done` is `key=value` lines, `done_version=2`.** Readers take the keys they know and ignore
   the rest; keys are only ever added. Every v2 field is written on every call (`unknown` rather
   than absent). `git_commit_observed` is the working tree at completion (`git_observed_at`), an
   observation — never a claim about the code a process had loaded.
 
-Run the test suite locally before pushing.
+Before pushing, run the test files you touched (one `include` each, seconds); the full suite runs
+sharded in CI on the same machine, so a local full run only repeats it serially.

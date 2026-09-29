@@ -48,6 +48,7 @@ export is_done, mark_done!, mark_running!, touch_running!, running_heartbeat
 export clear_running!, is_running
 export acquire_running!, refresh_running!, running_age_secs
 export new_owner_token, running_owner
+export start_heartbeat, stop_heartbeat, heartbeat_alive, HeartbeatHandle
 export artifact!, has_artifact, load_artifact, tryload_artifact, ArtifactBusy
 export build_ledger, record_figure, cleanup_stale
 export observe_sources, load_recorded, read_done
@@ -71,6 +72,7 @@ include("core/paths.jl")        # _run_*_dir 等を log_toml.jl から使う
 
 include("io/atomic.jl")
 include("io/data.jl")
+include("io/lock.jl")         # the lock protocol under .running and artifact locks
 include("io/status.jl")
 include("io/artifact.jl")      # [artifacts.<name>]: built once, reused across cells and runs
 

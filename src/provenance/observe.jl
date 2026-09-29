@@ -36,6 +36,51 @@ const ENV_RECORDED = (
     "SLURM_NODEID",
 )
 
+# ── per-process memo ─────────────────────────────────────────────────────────────────────────
+#
+# A process that observes once per key (SweepRunner calls `run!` per key) would otherwise re-read
+# and re-hash every source file each time: ~5000 files, 35 MB, 0.7 s locally and far more on a
+# network filesystem, for an answer that cannot have changed for most of them. What is memoised:
+#
+#   * a file's entry, keyed by (size, mtime, ctime, inode), and only when its mtime/ctime is at
+#     least RACY_SECONDS older than the moment it was hashed — git's "racily clean" rule. A file
+#     written within the timestamp granularity of its last hash (a second on some network
+#     filesystems) keeps the same key while its bytes change, so it is hashed again every time;
+#   * a depot package's or artifact's whole entry list, keyed by (directory, tree hash, limits):
+#     those trees are content-addressed and are not re-read at all;
+#   * a precompile cache header, keyed by (path, mtime, size);
+#   * the blobs already known to be in a vault's store, so they are not stat'ed again.
+#
+# Contents are never held: a memoised file's blob is re-read from its path, and checked against
+# its digest, only when the vault does not have it yet. The memo only removes repeated work; every
+# snapshot and binding is computed from the same entries as before.
+const RACY_SECONDS = 2.0
+const _MEMO_LOCK = ReentrantLock()
+const _FILE_MEMO = Dict{String,Tuple{NTuple{4,Float64},Any}}()      # path → (stat key, entry)
+const _TREE_MEMO = Dict{Tuple{String,String,Int,Int},Any}()         # (dir, tree, limits) → entries
+const _HEADER_MEMO = Dict{Tuple{String,Float64,Int},Any}()
+const _BLOBS_PRESENT = Set{String}()                                # blob paths known to exist
+
+"""
+    clear_observation_memo!()
+
+Forget everything [`observe_sources`](@ref) memoised in this process. Needed only when that
+memo's assumptions are broken from outside: a file rewritten while its size, mtime, ctime and
+inode all stay the same, a depot tree edited in place, or a vault's blob store deleted while the
+process runs.
+"""
+function clear_observation_memo!()
+    lock(_MEMO_LOCK) do
+        empty!(_FILE_MEMO)
+        empty!(_TREE_MEMO)
+        empty!(_HEADER_MEMO)
+        return empty!(_BLOBS_PRESENT)
+    end
+    return nothing
+end
+
+_stat_key(st) = (Float64(st.size), Float64(st.mtime), Float64(st.ctime), Float64(st.inode))
+
 function _provenance_dir(vault::Vault)
     return joinpath(vault.outdir, DATAVAULT_DIR_NAME, vault.spec.study.project_name)
 end
@@ -269,12 +314,26 @@ function _entry(root, rel, hash_limit, blobs, notes; materialize_limit)::SourceE
                 root.name, rel, "file", mode, st.size, "skipped", 0x00000000, full
             )
         end
+        key = _stat_key(st)
+        hit = lock(() -> get(_FILE_MEMO, full, nothing), _MEMO_LOCK)
+        if hit !== nothing && hit[1] == key
+            e = hit[2]::SourceEntry
+            # Same file, same bytes: its blob is read back from `full` only if the store lacks it.
+            _materialize(rel, e.size, materialize_limit) && (blobs[e.sha256] = full)
+            return SourceEntry(
+                root.name, rel, e.type, e.mode, e.size, e.sha256, e.crc32c, full
+            )
+        end
+        hashed_at = time()
         bytes = read(full)
         sha = bytes2hex(sha256(bytes))
         _materialize(rel, length(bytes), materialize_limit) && (blobs[sha] = bytes)
-        return SourceEntry(
+        e = SourceEntry(
             root.name, rel, "file", mode, length(bytes), sha, crc32c(bytes), full
         )
+        hashed_at - max(st.mtime, st.ctime) > RACY_SECONDS &&
+            lock(() -> (_FILE_MEMO[full] = (key, e)), _MEMO_LOCK)
+        return e
     elseif isdir(st)
         push!(notes, "$(root.name):$rel: a directory (a submodule?) is not inventoried")
         return SourceEntry(root.name, rel, "dir", "-", 0, "", 0x00000000, full)
@@ -282,13 +341,56 @@ function _entry(root, rel, hash_limit, blobs, notes; materialize_limit)::SourceE
     return SourceEntry(root.name, rel, "missing", "-", 0, "", 0x00000000, full)
 end
 
+# A blob's content as the memo keeps it: the path of a file entry with that digest, or the
+# bytes themselves for a symlink target (no file holds those).
+function _blob_source(entries, sha, bytes)
+    i = findfirst(e -> e.sha256 == sha && e.type == "file", entries)
+    return i === nothing ? bytes : entries[i].full
+end
+
 function _inventory(
     roots; hash_limit::Integer, materialize_limit::Integer=0, exclude=nothing
 )
     entries = SourceEntry[]
-    blobs = Dict{String,Vector{UInt8}}()
+    blobs = Dict{String,Any}()     # digest → bytes, or the path to read them from
     notes = String[]
     for root in roots
+        # A depot package or artifact is its tree hash: read once per process.
+        if root.kind in (:depot, :artifact) && !isempty(root.tree)
+            tk = (
+                String(root.dir), String(root.tree), Int(hash_limit), Int(materialize_limit)
+            )
+            memo = lock(() -> get(_TREE_MEMO, tk, nothing), _MEMO_LOCK)
+            if memo !== nothing
+                append!(entries, memo[1])
+                for (sha, src) in memo[2]
+                    haskey(blobs, sha) || (blobs[sha] = src)
+                end
+                append!(notes, memo[3])
+                continue
+            end
+            files = _root_files(root; exclude)
+            if files === nothing
+                push!(notes, "$(root.name): files could not be listed")
+                continue
+            end
+            rblobs = Dict{String,Any}()
+            rnotes = String[]
+            rentries = [
+                _entry(root, rel, hash_limit, rblobs, rnotes; materialize_limit) for
+                rel in files
+            ]
+            # Symlink targets stay as bytes (they are small); file contents become paths.
+            srcs = Dict{String,Any}(
+                sha => (b isa AbstractString ? b : _blob_source(rentries, sha, b)) for
+                (sha, b) in rblobs
+            )
+            lock(() -> (_TREE_MEMO[tk] = (rentries, srcs, rnotes)), _MEMO_LOCK)
+            append!(entries, rentries)
+            merge!((a, b) -> a, blobs, rblobs)
+            append!(notes, rnotes)
+            continue
+        end
         files = _root_files(root; exclude)
         if files === nothing
             push!(notes, "$(root.name): files could not be listed")
@@ -335,8 +437,21 @@ end
 # every blob it names is already there.
 function _publish_snapshot(vault::Vault, tsv::String, state::Dict, blobs)
     sources = _sources_dir(vault)
-    for (sha, bytes) in blobs
-        _atomic_bytes_write(joinpath(sources, "blobs", sha), bytes)
+    for (sha, content) in blobs
+        path = joinpath(sources, "blobs", sha)
+        lock(() -> path in _BLOBS_PRESENT, _MEMO_LOCK) && continue
+        if !isfile(path)
+            bytes = content isa AbstractString ? read(content) : content
+            # A memoised entry's file is read back here; if it changed since, its digest says so.
+            if bytes2hex(sha256(bytes)) != sha
+                lock(() -> delete!(_FILE_MEMO, content), _MEMO_LOCK)   # a retry re-hashes it
+                error(
+                    "DataVault: $content changed while it was being observed; observe again"
+                )
+            end
+            _atomic_bytes_write(path, bytes)
+        end
+        lock(() -> push!(_BLOBS_PRESENT, path), _MEMO_LOCK)
     end
     hex = bytes2hex(sha256(tsv))
     id = "$(SOURCE_RECIPE)-$hex"
@@ -371,6 +486,17 @@ end
 # is laid out differently in this Julia (an internal API, checked on 1.12 and 1.13).
 function _cached_sources(cachepath)
     cachepath === nothing && return nothing
+    st = stat(cachepath)
+    isfile(st) || return _parse_cached_sources(cachepath)
+    key = (String(cachepath), Float64(st.mtime), Int(st.size))
+    hit = lock(() -> get(_HEADER_MEMO, key, missing), _MEMO_LOCK)
+    hit === missing || return hit
+    v = _parse_cached_sources(cachepath)
+    lock(() -> (_HEADER_MEMO[key] = v), _MEMO_LOCK)
+    return v
+end
+
+function _parse_cached_sources(cachepath)
     try
         h = Base.parse_cache_header(cachepath)[2]
         incs = [x for x in vcat(h[1], h[2]) if x isa Base.CacheHeaderIncludes]
@@ -384,15 +510,26 @@ end
 # bytes, `differs` when one does not, `unknown` when a loaded package cannot be checked, and
 # `not-loaded` when none came from it.
 function _loaded_status(roots, entries)::Dict{String,String}
-    byfile = Dict(
-        _real(e.full) => e for e in entries if e.type == "file" && e.sha256 != "skipped"
+    # `realpath` walks every component of its argument, and every entry, every loaded package
+    # against every root, and every file a package was built from needs one: ~20000 walks, most
+    # of an observation once its hashing is memoised. A directory is resolved once per call
+    # instead; only a path that is itself a link is walked whole.
+    dirs = Dict{String,String}()
+    realdir(d) = get!(() -> _real(d), dirs, d)
+    real_in_dir(p) = joinpath(realdir(dirname(p)), basename(p))
+    real_any(p) = islink(p) ? _real(p) : real_in_dir(p)
+    rootdirs = [rstrip(realdir(r.dir), '/') * "/" for r in roots]
+    byfile = Dict(     # a "file" entry was lstat'd as a regular file: only its directory can link
+        real_in_dir(e.full) => e for
+        e in entries if e.type == "file" && e.sha256 != "skipped"
     )
     status = Dict(r.name => "not-loaded" for r in roots)
     rank = Dict("not-loaded" => 0, "matches" => 1, "unknown" => 2, "differs" => 3)
     raise!(name, s) = rank[s] > rank[status[name]] && (status[name] = s)
     for (_, origin) in Base.pkgorigins
         origin.path === nothing && continue
-        i = findfirst(r -> _inside(origin.path, r.dir), roots)
+        path = real_any(origin.path)
+        i = findfirst(d -> startswith(path, d), rootdirs)
         i === nothing && continue
         name = roots[i].name
         includes = _cached_sources(origin.cachepath)
@@ -401,7 +538,7 @@ function _loaded_status(roots, entries)::Dict{String,String}
             continue
         end
         for inc in includes
-            e = get(byfile, _real(inc.filename), nothing)
+            e = get(byfile, real_any(inc.filename), nothing)
             if e === nothing
                 raise!(name, "unknown")                # built from a file the snapshot does not hold
             elseif e.size != inc.fsize || e.crc32c != inc.hash

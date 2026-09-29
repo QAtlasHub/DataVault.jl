@@ -67,6 +67,41 @@ config_root(rec) = only(r for r in rec["roots"] if r["name"] == "config")
     end
 end
 
+@testset "observe_sources: a memoised file is re-hashed when it changes, and only then" begin
+    sha(file) = bytes2hex(sha256(read(file)))
+    with_observed_repo() do t
+        DataVault.clear_observation_memo!()
+        src = joinpath(t.pkg, "src", "$(t.name).jl")
+        # Within the racy window a file is never memoised: its timestamp cannot vouch for it.
+        observe_sources(t.vault)
+        @test !haskey(DataVault._FILE_MEMO, src)
+        sleep(DataVault.RACY_SECONDS + 0.5)
+        base = source_of(t)
+        @test haskey(DataVault._FILE_MEMO, src)            # hashed after the window: memoised
+        @test source_of(t) == base                         # and a repeat agrees with it
+
+        # A lost blob is restored from the memoised file, not trusted to exist.
+        blob = joinpath(obs_dir(t), "sources", "blobs", sha(src))
+        rm(blob)
+        DataVault.clear_observation_memo!()
+        sleep(DataVault.RACY_SECONDS + 0.5)
+        observe_sources(t.vault)                           # memoises, blob store lacks it
+        rm(blob; force=true)
+        empty!(DataVault._BLOBS_PRESENT)
+        @test source_of(t) == base
+        @test isfile(blob) && sha(blob) == basename(blob)
+
+        # A same-size edit of a memoised file, even with its mtime put back, is seen (ctime).
+        ref = src * ".ref"
+        cp(src, ref; force=true)
+        run(`touch -m -r $src $ref`)
+        write(src, "module $(t.name)\nanswer() = 43\nend\n")
+        run(`touch -m -r $ref $src`)                       # mtime put back
+        rm(ref)
+        @test source_of(t) != base
+    end
+end
+
 @testset "observe_sources: contents are kept by size, and .jl/.toml at any size" begin
     sha(file) = bytes2hex(sha256(read(file)))
     with_observed_repo() do t
